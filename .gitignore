@@ -1,1 +1,8 @@
 arxiv-metadata-oai-snapshot.json
+.venv/
+artifacts/
+.jupyter/
+.jupyter_data/
+.jupyter_env/
+.ipython/
+__pycache__/
