@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Sequence
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -66,7 +68,7 @@ def stable_int(text: str) -> int:
     return int(stable_sha1(text)[:12], 16)
 
 
-def require_dependency(module_name: str, package_name: str | None = None):
+def require_dependency(module_name: str, package_name: Optional[str] = None):
     """Import an optional dependency with a clear error message."""
 
     try:
@@ -112,10 +114,21 @@ def save_numpy(path: Path, array: np.ndarray) -> None:
     np.save(path, array)
 
 
-def load_numpy(path: Path) -> np.ndarray:
+def load_numpy(path: Path, mmap_mode: Optional[str] = None) -> np.ndarray:
     """Load a saved numpy array."""
 
-    return np.load(path, allow_pickle=False)
+    return np.load(path, allow_pickle=False, mmap_mode=mmap_mode)
+
+
+def link_or_copy_file(source: Path, destination: Path) -> None:
+    """Create a hard link when possible, else fall back to copying."""
+
+    ensure_dir(destination.parent)
+    destination.unlink(missing_ok=True)
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
 
 
 @contextmanager
@@ -128,4 +141,3 @@ def timer() -> Iterator[List[float]]:
         yield cell
     finally:
         cell[0] = time.perf_counter() - start
-

@@ -12,7 +12,7 @@ from src.config import ProfileConfig
 def build_results_notebook(profile: ProfileConfig) -> str:
     """Create the local benchmark summary notebook."""
 
-    output_path = profile.results_dir() / "Local_Benchmark_Summary.ipynb"
+    output_path = profile.results_dir() / f"{profile.name}_Benchmark_Summary.ipynb"
     profile.results_dir().mkdir(parents=True, exist_ok=True)
 
     nb = nbf.v4.new_notebook()
@@ -26,11 +26,11 @@ def build_results_notebook(profile: ProfileConfig) -> str:
 
     md(
         """
-        # Local Benchmark Summary
+        # Benchmark Summary
 
         This notebook is intentionally lightweight. It only loads saved modeling artifacts from
-        `artifacts/modeling/` and renders compact report tables and figures for the laptop-safe
-        benchmark pipeline.
+        `artifacts/modeling/` and renders compact report tables and figures for the configured
+        benchmark profile.
         """
     )
 
@@ -66,8 +66,9 @@ def build_results_notebook(profile: ProfileConfig) -> str:
 
     md(
         """
-        The local profile uses the full raw corpus only for the already-computed EDA artifacts.
-        All modeling experiments below run on deterministic cached subsets sized for a 16GB laptop.
+        This notebook reads cached artifacts produced by the active pipeline profile. Depending on
+        the chosen profile, the underlying modeling runs may use either deterministic subsets or
+        the full cleaned corpus.
         """
     )
 
@@ -130,9 +131,9 @@ def build_results_notebook(profile: ProfileConfig) -> str:
         """
         ## Interpretation Notes
 
-        - TF-IDF is the main large local baseline and should populate first.
-        - MPNET is the main dense baseline for local experiments and retrieval.
-        - BERT exists in the codebase but is disabled by default to keep the local profile practical.
+        - TF-IDF is the main sparse baseline and should usually populate first.
+        - Dense encoder runs depend on the selected profile and hardware budget.
+        - Full-corpus H100 runs use scalable settings rather than the smaller local defaults.
         """
     )
 
@@ -146,4 +147,3 @@ if __name__ == "__main__":
     from src.config import get_profile
 
     print(build_results_notebook(get_profile()))
-

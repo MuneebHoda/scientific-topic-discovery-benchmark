@@ -1,4 +1,4 @@
-"""Primary KMeans clustering runner for reduced embeddings."""
+"""Scalable KMeans clustering runner for reduced embeddings."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Dict
 
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 
 from src.config import ProfileConfig
 from src.io_utils import ensure_dir, load_json, load_numpy, save_numpy, write_json
@@ -30,9 +30,9 @@ def run_kmeans_clustering(profile: ProfileConfig, embedding_name: str, subset_na
         return metadata
 
     reduced_dir = profile.embeddings_dir() / embedding_name / subset_name / "reduced"
-    train_embeddings = load_numpy(reduced_dir / "train_reduced.npy")
-    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy")
-    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy")
+    train_embeddings = load_numpy(reduced_dir / "train_reduced.npy", mmap_mode="r")
+    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy", mmap_mode="r")
+    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy", mmap_mode="r")
 
     search_rows = []
     best = None
@@ -43,8 +43,26 @@ def run_kmeans_clustering(profile: ProfileConfig, embedding_name: str, subset_na
         fallback_k = max(2, min(20, int(train_embeddings.shape[0] - 1)))
         valid_k_values = [fallback_k]
         notes = f"Default K grid exceeded train size; used fallback k={fallback_k}."
+
+    if profile.kmeans_mode == "mini_batch":
+        use_minibatch = True
+    elif profile.kmeans_mode == "full":
+        use_minibatch = False
+    else:
+        use_minibatch = int(train_embeddings.shape[0]) >= int(profile.kmeans_minibatch_threshold)
+
+    algorithm_name = "MiniBatchKMeans" if use_minibatch else "KMeans"
     for k in valid_k_values:
-        model = KMeans(n_clusters=int(k), random_state=profile.seed, n_init=10)
+        if use_minibatch:
+            model = MiniBatchKMeans(
+                n_clusters=int(k),
+                random_state=profile.seed,
+                n_init=10,
+                batch_size=int(profile.kmeans_batch_size),
+                max_iter=int(profile.kmeans_max_iter),
+            )
+        else:
+            model = KMeans(n_clusters=int(k), random_state=profile.seed, n_init=10, max_iter=int(profile.kmeans_max_iter))
         model.fit(train_embeddings)
         val_labels = model.predict(val_embeddings).astype(np.int32)
         score = _silhouette_score_sample(
@@ -53,7 +71,13 @@ def run_kmeans_clustering(profile: ProfileConfig, embedding_name: str, subset_na
             sample_size=profile.silhouette_eval_sample_size,
             seed=profile.seed,
         )
-        row = {"embedding": embedding_name, "subset_name": subset_name, "k": int(k), "validation_silhouette": score}
+        row = {
+            "embedding": embedding_name,
+            "subset_name": subset_name,
+            "k": int(k),
+            "algorithm": algorithm_name,
+            "validation_silhouette": score,
+        }
         search_rows.append(row)
         if best is None or row["validation_silhouette"] > best["validation_silhouette"]:
             best = {
@@ -83,7 +107,7 @@ def run_kmeans_clustering(profile: ProfileConfig, embedding_name: str, subset_na
         "validation_silhouette": best["validation_silhouette"],
         "runtime_seconds": time.perf_counter() - start,
         "reused_cache": False,
-        "notes": notes,
+        "notes": f"{algorithm_name} used. {notes}".strip(),
     }
     write_json(metadata_path, metadata)
     return metadata

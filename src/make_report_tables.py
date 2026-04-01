@@ -13,14 +13,16 @@ from src.io_utils import load_json, write_json
 
 def _expected_pipeline_rows(profile: ProfileConfig) -> List[Dict]:
     return [
-        {"pipeline_name": "tfidf_kmeans_main", "enabled_by_default": True, "embedding": "tfidf", "clustering": "kmeans", "subset_name": "tfidf_main"},
-        {"pipeline_name": "tfidf_hdbscan_small", "enabled_by_default": bool(profile.run_hdbscan), "embedding": "tfidf", "clustering": "hdbscan", "subset_name": "hdbscan_shared"},
-        {"pipeline_name": "mpnet_kmeans_main", "enabled_by_default": bool(profile.run_mpnet), "embedding": "mpnet", "clustering": "kmeans", "subset_name": "mpnet_main"},
-        {"pipeline_name": "mpnet_hdbscan_small", "enabled_by_default": bool(profile.run_mpnet and profile.run_hdbscan), "embedding": "mpnet", "clustering": "hdbscan", "subset_name": "hdbscan_shared"},
-        {"pipeline_name": "tfidf_agglomerative_small", "enabled_by_default": bool(profile.run_agglomerative), "embedding": "tfidf", "clustering": "agglomerative", "subset_name": "agglomerative_small"},
-        {"pipeline_name": "mpnet_agglomerative_small", "enabled_by_default": bool(profile.run_mpnet and profile.run_agglomerative), "embedding": "mpnet", "clustering": "agglomerative", "subset_name": "agglomerative_small"},
-        {"pipeline_name": "bert_kmeans_main", "enabled_by_default": bool(profile.run_bert), "embedding": "bert", "clustering": "kmeans", "subset_name": "bert_main"},
-        {"pipeline_name": "mpnet_retrieval_main", "enabled_by_default": bool(profile.run_mpnet), "embedding": "mpnet", "clustering": "retrieval", "subset_name": "mpnet_main"},
+        {"pipeline_name": "tfidf_kmeans_main", "enabled_by_default": True, "embedding": "tfidf", "clustering": "kmeans", "subset_name": profile.tfidf_main_subset_name},
+        {"pipeline_name": "tfidf_hdbscan_small", "enabled_by_default": bool(profile.run_hdbscan), "embedding": "tfidf", "clustering": "hdbscan", "subset_name": profile.hdbscan_subset_name},
+        {"pipeline_name": "mpnet_kmeans_main", "enabled_by_default": bool(profile.run_mpnet), "embedding": "mpnet", "clustering": "kmeans", "subset_name": profile.mpnet_main_subset_name},
+        {"pipeline_name": "mpnet_hdbscan_small", "enabled_by_default": bool(profile.run_mpnet and profile.run_hdbscan), "embedding": "mpnet", "clustering": "hdbscan", "subset_name": profile.hdbscan_subset_name},
+        {"pipeline_name": "tfidf_agglomerative_small", "enabled_by_default": bool(profile.run_agglomerative), "embedding": "tfidf", "clustering": "agglomerative", "subset_name": profile.agglomerative_subset_name},
+        {"pipeline_name": "mpnet_agglomerative_small", "enabled_by_default": bool(profile.run_mpnet and profile.run_agglomerative), "embedding": "mpnet", "clustering": "agglomerative", "subset_name": profile.agglomerative_subset_name},
+        {"pipeline_name": "bert_kmeans_main", "enabled_by_default": bool(profile.run_bert), "embedding": "bert", "clustering": "kmeans", "subset_name": profile.bert_main_subset_name},
+        {"pipeline_name": "bert_hdbscan_small", "enabled_by_default": bool(profile.run_bert and profile.run_hdbscan), "embedding": "bert", "clustering": "hdbscan", "subset_name": profile.hdbscan_subset_name},
+        {"pipeline_name": "bert_agglomerative_small", "enabled_by_default": bool(profile.run_bert and profile.run_agglomerative), "embedding": "bert", "clustering": "agglomerative", "subset_name": profile.agglomerative_subset_name},
+        {"pipeline_name": "mpnet_retrieval_main", "enabled_by_default": bool(profile.run_mpnet), "embedding": "mpnet", "clustering": "retrieval", "subset_name": profile.mpnet_main_subset_name},
     ]
 
 
@@ -87,9 +89,9 @@ def refresh_report_artifacts(profile: ProfileConfig) -> Dict[str, str]:
             for subset_name, details in split_summary.get("subset_summaries", {}).items()
         },
         "notes": [
-            "local_profile uses the full corpus only for existing EDA artifacts.",
-            "modeling runs on laptop-safe deterministic subsets with cached embeddings and reductions.",
-            "BERT is implemented but disabled by default in local_profile.",
+            "local_profile uses deterministic subsets sized for a laptop-friendly pipeline.",
+            "The H100 Colab profile can run TF-IDF and BERT over the full cleaned corpus.",
+            "Full-corpus runs use scalable approximations where needed, including MiniBatchKMeans and UMAP bypass on very large splits.",
         ],
     }
     split_report_path = results_dir / "split_report.json"

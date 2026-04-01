@@ -1,10 +1,9 @@
-"""Dense retrieval evaluation for the local MPNET benchmark."""
+"""Dense retrieval evaluation with sklearn and optional FAISS backends."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -19,10 +18,10 @@ from src.io_utils import ensure_dir, load_numpy, write_json
 class SklearnCosineIndex:
     """Simple cosine nearest-neighbor index for local mode."""
 
-    embeddings: np.ndarray | None = None
-    ids: np.ndarray | None = None
-    labels: np.ndarray | None = None
-    model: NearestNeighbors | None = None
+    embeddings: Optional[np.ndarray] = None
+    ids: Optional[np.ndarray] = None
+    labels: Optional[np.ndarray] = None
+    model: Optional[NearestNeighbors] = None
 
     def fit(self, embeddings: np.ndarray, ids: List[str], labels: List[str]) -> None:
         self.embeddings = np.asarray(embeddings, dtype=np.float32)
@@ -38,6 +37,45 @@ class SklearnCosineIndex:
         return distances, indices
 
 
+@dataclass
+class FaissInnerProductIndex:
+    """Optional FAISS index for Colab/server profiles."""
+
+    ids: Optional[np.ndarray] = None
+    labels: Optional[np.ndarray] = None
+    index = None
+
+    def fit(self, embeddings: np.ndarray, ids: List[str], labels: List[str]) -> None:
+        faiss = __import__("faiss")
+        normalized = np.asarray(embeddings, dtype=np.float32).copy()
+        faiss.normalize_L2(normalized)
+        self.ids = np.asarray(ids)
+        self.labels = np.asarray(labels)
+        self.index = faiss.IndexFlatIP(normalized.shape[1])
+        self.index.add(normalized)
+
+    def query(self, queries: np.ndarray, top_k: int) -> Tuple[np.ndarray, np.ndarray]:
+        if self.index is None:
+            raise RuntimeError("Index has not been fit.")
+        faiss = __import__("faiss")
+        normalized = np.asarray(queries, dtype=np.float32).copy()
+        faiss.normalize_L2(normalized)
+        scores, indices = self.index.search(normalized, int(top_k))
+        return scores, indices
+
+
+def _build_index(backend: str):
+    """Create the requested retrieval backend, with graceful FAISS fallback."""
+
+    if backend == "faiss":
+        try:
+            __import__("faiss")
+            return FaissInnerProductIndex(), "faiss"
+        except ModuleNotFoundError:
+            return SklearnCosineIndex(), "sklearn"
+    return SklearnCosineIndex(), "sklearn"
+
+
 def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: str = "mpnet_main") -> pd.DataFrame:
     """Evaluate centroid-based dense retrieval over the MPNET train split."""
 
@@ -50,12 +88,10 @@ def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: str = "mpnet_m
 
     split_frames = load_subset_split_frames(profile, subset_name)
     train_embeddings = load_numpy(profile.embeddings_dir() / "mpnet" / subset_name / "train_raw.npy")
-    test_embeddings = load_numpy(profile.embeddings_dir() / "mpnet" / subset_name / "test_raw.npy")
     train_ids = split_frames["train"]["id"].astype(str).tolist()
     train_labels = split_frames["train"]["primary_category"].astype(str).tolist()
-    test_labels = split_frames["test"]["primary_category"].astype(str).tolist()
 
-    index = SklearnCosineIndex()
+    index, actual_backend = _build_index(profile.retrieval_backend)
     index.fit(train_embeddings, train_ids, train_labels)
 
     train_frame = split_frames["train"].copy()
@@ -121,7 +157,7 @@ def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: str = "mpnet_m
     write_json(
         metadata_path,
         {
-            "backend": profile.retrieval_backend,
+            "backend": actual_backend,
             "subset_name": subset_name,
             "train_size": int(len(train_frame)),
             "test_size": int(len(split_frames["test"])),

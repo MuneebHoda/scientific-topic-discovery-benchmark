@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import itertools
 import pickle
-from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -13,7 +12,7 @@ import pandas as pd
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics import normalized_mutual_info_score
 
-from src.benchmark_splits import load_subset_split_frames
+from src.benchmark_splits import iter_split_batches, load_split_frame, split_row_count
 from src.config import ProfileConfig
 from src.io_utils import ensure_dir, load_json, load_numpy, upsert_csv_records, write_json
 from src.preprocess import tokenize_for_npmi
@@ -21,7 +20,7 @@ from src.reduce_umap import _silhouette_score_sample
 
 
 def _token_cache_path(profile: ProfileConfig, subset_name: str, split_name: str) -> Path:
-    return ensure_dir(profile.metrics_dir() / "token_cache") / f"{subset_name}_{split_name}_tokens.pkl"
+    return ensure_dir(profile.metrics_dir() / "token_cache") / f"{subset_name}_{split_name}_{profile.npmi_sample_size}_tokens.pkl"
 
 
 def _load_or_build_token_cache(profile: ProfileConfig, subset_name: str, split_name: str, texts: Sequence[str]) -> List[List[str]]:
@@ -129,18 +128,34 @@ def evaluate_clustering_run(
 ) -> Dict:
     """Evaluate a cached clustering run and append it to the unified metrics table."""
 
-    split_frames = load_subset_split_frames(profile, subset_name)
     reduced_dir = profile.embeddings_dir() / embedding_name / subset_name / "reduced"
     metadata_path = profile.clustering_dir() / f"{embedding_name}_{clustering_name}" / subset_name / "metadata.json"
     metadata = load_json(metadata_path, default={}) or {}
     labels = _load_labels_for_clustering(profile, embedding_name, clustering_name, subset_name)
-    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy")
-    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy")
+    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy", mmap_mode="r")
+    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy", mmap_mode="r")
 
-    val_true = split_frames["val"]["primary_category"].astype(str).to_numpy()
-    test_true = split_frames["test"]["primary_category"].astype(str).to_numpy()
-    test_texts = split_frames["test"]["text_input"].astype(str).tolist()
-    token_cache = _load_or_build_token_cache(profile, subset_name, "test", test_texts)
+    val_true = load_split_frame(profile, subset_name, "val", columns=["primary_category"])["primary_category"].astype(str).to_numpy()
+    test_true = load_split_frame(profile, subset_name, "test", columns=["primary_category"])["primary_category"].astype(str).to_numpy()
+
+    test_count = split_row_count(profile, subset_name, "test")
+    if test_count > profile.npmi_sample_size:
+        rng = np.random.default_rng(profile.seed)
+        sampled_indices = np.sort(rng.choice(test_count, size=profile.npmi_sample_size, replace=False))
+    else:
+        sampled_indices = np.arange(test_count, dtype=np.int64)
+
+    sampled_texts = []
+    target_positions = set(int(idx) for idx in sampled_indices.tolist())
+    cursor = 0
+    for batch in iter_split_batches(profile, subset_name, "test", columns=["text_input", "primary_category"]):
+        frame = batch.to_pandas()
+        for _, row in frame.iterrows():
+            if cursor in target_positions:
+                sampled_texts.append(str(row["text_input"]))
+            cursor += 1
+    sampled_pred_labels = labels["test"][sampled_indices]
+    token_cache = _load_or_build_token_cache(profile, subset_name, "test", sampled_texts)
 
     val_silhouette = _silhouette_score_sample(
         val_embeddings,
@@ -156,13 +171,13 @@ def evaluate_clustering_run(
     )
     val_nmi = float(normalized_mutual_info_score(val_true, labels["val"]))
     test_nmi = float(normalized_mutual_info_score(test_true, labels["test"]))
-    test_npmi = compute_npmi(test_texts, labels["test"], token_cache)
+    test_npmi = compute_npmi(sampled_texts, sampled_pred_labels, token_cache)
 
     row = {
         "embedding": embedding_name,
         "clustering": clustering_name,
         "subset_name": subset_name,
-        "subset_size": int(len(split_frames["test"])),
+        "subset_size": int(test_count),
         "best_param": metadata.get("best_param", ""),
         "silhouette": test_silhouette,
         "npmi": test_npmi,
@@ -171,7 +186,10 @@ def evaluate_clustering_run(
         "validation_nmi": val_nmi,
         "runtime_seconds": metadata.get("runtime_seconds"),
         "ran_successfully": True,
-        "notes": metadata.get("notes", ""),
+        "notes": (
+            metadata.get("notes", "")
+            + (f" NPMI computed on a deterministic sample of {len(sampled_texts):,} test documents." if len(sampled_texts) < test_count else "")
+        ).strip(),
     }
     upsert_csv_records(
         profile.clustering_metrics_path(),
@@ -187,4 +205,3 @@ def evaluate_clustering_run(
     detail_path = ensure_dir(profile.metrics_dir() / "details") / f"{embedding_name}_{clustering_name}_{subset_name}.json"
     write_json(detail_path, details)
     return row
-

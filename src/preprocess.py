@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
@@ -105,7 +105,7 @@ def is_placeholder_abstract(abstract: str) -> bool:
     return any(phrase in text for phrase in PLACEHOLDER_PHRASES)
 
 
-def submission_year_from_versions(versions: object) -> int | None:
+def submission_year_from_versions(versions: object) -> Optional[int]:
     """Extract the submission year from the first version block."""
 
     from email.utils import parsedate_to_datetime
@@ -124,7 +124,7 @@ def submission_year_from_versions(versions: object) -> int | None:
         return int(match.group(0)) if match else None
 
 
-def update_year_from_value(value: object) -> int | None:
+def update_year_from_value(value: object) -> Optional[int]:
     """Extract the update year from the update_date field."""
 
     text = normalize_whitespace(value)
@@ -161,4 +161,3 @@ def tokenize_for_npmi(texts: Iterable[str]) -> List[List[str]]:
         cleaned = tfidf_clean(text)
         tokenized.append([token for token in cleaned.split() if token])
     return tokenized
-

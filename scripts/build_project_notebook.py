@@ -4,7 +4,7 @@ import nbformat as nbf
 
 
 ROOT_TITLE = "A Benchmark of Text Embeddings and Clustering Algorithms for Scientific Topic Discovery"
-NOTEBOOK_TITLE = "Exploratory Data Analysis of the arXiv Scientific Paper Corpus"
+NOTEBOOK_TITLE = "Full-Dataset Exploratory Data Analysis of the arXiv Scientific Paper Corpus"
 
 
 nb = nbf.v4.new_notebook()
@@ -24,15 +24,15 @@ md(
     # {ROOT_TITLE}
     ## {NOTEBOOK_TITLE}
 
-    This notebook develops a presentation-quality exploratory data analysis (EDA) for a large arXiv-style scientific paper corpus. The analysis is designed to support downstream benchmarking of text embeddings, clustering algorithms, and category-based evaluation for scientific topic discovery.
+    This notebook presents a full-dataset exploratory data analysis (EDA) for an arXiv-style scientific paper corpus. The objective is not only to describe the data, but to generate evidence that directly informs our downstream benchmark of text embeddings, clustering algorithms, and category-based evaluation for scientific topic discovery.
 
     **Notebook objectives**
-    - understand dataset structure, scale, and field completeness,
-    - quantify category imbalance and multi-label behavior,
-    - inspect title and abstract properties that matter for text representation,
-    - identify preprocessing choices that are sensible for embeddings and clustering,
-    - motivate an experimental split strategy, and
-    - surface risks, caveats, and report-ready recommendations.
+    - characterize the structure, scale, and completeness of the dataset,
+    - quantify category imbalance, multi-label behavior, and domain skew,
+    - inspect title and abstract properties that matter for scientific embeddings,
+    - evaluate preprocessing choices in a modeling-aware way,
+    - justify a train/validation/test split strategy on the full corpus, and
+    - identify risks and design choices that should be stated explicitly in the project report.
     """
 )
 
@@ -40,14 +40,22 @@ md(
     """
     **Project Context**
 
-    The downstream goal is not generic text classification; it is unsupervised or weakly supervised topic discovery over scientific papers. That makes several aspects of EDA especially important:
+    The downstream task is scientific topic discovery, not supervised classification. That changes what matters in EDA:
 
-    - label distributions matter because category labels will be used as external reference signals for evaluating clustering quality,
-    - text artifacts matter because scientific abstracts contain formulas, URLs, and cross-domain notation that interact differently with TF-IDF baselines versus transformer embeddings,
-    - time and domain skew matter because a benchmark can become dominated by recent, computer-science-heavy content if these shifts are not documented, and
-    - scale matters because some clustering algorithms that look reasonable on small corpora become impractical on a corpus with millions of documents.
+    - arXiv categories act as **reference labels** for evaluating clusters, so their imbalance and multi-label structure affect how fair our benchmark will be,
+    - scientific abstracts contain formulas, markup, URLs, and discipline-specific notation that influence both classical baselines and transformer embeddings,
+    - temporal growth and domain skew can make a benchmark appear broader than it really is if recent computer-science-heavy growth is not documented, and
+    - computational scale matters because methods that look reasonable on small subsets can become infeasible on a corpus with millions of documents.
 
-    To keep the notebook reproducible while respecting the dataset size, metadata-level analyses are computed from full-dataset cached summaries, while text-heavy analyses use a reproducible reservoir sample drawn from the full corpus.
+    This notebook is designed to operate on the **entire dataset**. The expensive work happens in a cache-building step that streams through the raw JSONL file and saves reusable artifacts. Displayed examples are selective for readability, but the reported statistics, split analysis, and core distributions are built from the full corpus.
+    """
+)
+
+md(
+    """
+    **Colab Note**
+
+    This notebook is designed to run in Google Colab as well as a local Jupyter environment. For this EDA workflow, the limiting resources are **CPU throughput and available RAM**, not GPU acceleration. A GPU-enabled runtime is fine, but a **high-RAM runtime** is more important than a GPU for the expensive full-dataset passes.
     """
 )
 
@@ -55,7 +63,7 @@ md("## 1. Imports and Setup")
 
 md(
     """
-    The notebook expects a standard Python data-science stack. The first code cell checks for the required packages and installs any missing dependencies into the active kernel environment. If you prefer to install manually, run `pip install -r requirements.txt` before opening the notebook.
+    The first code cell validates the active kernel environment and installs any missing packages into that same environment. This makes the notebook easier to run both locally and in Google Colab.
     """
 )
 
@@ -65,6 +73,7 @@ code(
     import subprocess
     import sys
 
+    import csv
     import gzip
     import hashlib
     import json
@@ -73,6 +82,7 @@ code(
     import time
     from array import array
     from collections import Counter, defaultdict
+    from datetime import datetime
     from email.utils import parsedate_to_datetime
     from pathlib import Path
 
@@ -83,30 +93,27 @@ code(
         "seaborn": "seaborn",
         "sklearn": "scikit-learn",
         "IPython": "ipython",
+        "nbformat": "nbformat",
     }
 
     missing_packages = []
-    failed_imports = []
     for module_name, package_name in REQUIRED_PACKAGES.items():
         try:
             importlib.import_module(module_name)
         except Exception:
-            failed_imports.append(module_name)
             missing_packages.append(package_name)
 
     if missing_packages:
         missing_packages = sorted(set(missing_packages))
         print(f"Active kernel Python: {sys.executable}")
-        print("Installing missing packages for this kernel:", ", ".join(missing_packages))
+        print("Installing missing packages into this kernel environment:", ", ".join(missing_packages))
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", *missing_packages])
         except Exception as exc:
             raise RuntimeError(
-                "Automatic dependency installation failed. Run `pip install -r requirements.txt` "
-                "in the same environment as this notebook and rerun the first cells."
+                "Automatic dependency installation failed. Install `requirements.txt` into the same "
+                "environment as the notebook and rerun the first cell."
             ) from exc
-        for module_name in REQUIRED_PACKAGES:
-            importlib.import_module(module_name)
         print("Dependency installation complete.")
     else:
         print(f"Active kernel Python: {sys.executable}")
@@ -127,33 +134,41 @@ code(
     plt.rcParams["axes.labelsize"] = 12
     plt.rcParams["xtick.labelsize"] = 10
     plt.rcParams["ytick.labelsize"] = 10
+    plt.rcParams["legend.fontsize"] = 10
     pd.options.display.max_colwidth = 180
     pd.options.display.float_format = lambda x: f"{x:,.3f}"
 
-    DATA_PATH = Path("arxiv-metadata-oai-snapshot.json")
-    ARTIFACT_DIR = Path("artifacts/eda")
+    IS_COLAB = "google.colab" in sys.modules
+
+    DATA_CANDIDATES = [
+        Path("arxiv-metadata-oai-snapshot.json"),
+        Path("/content/arxiv-metadata-oai-snapshot.json"),
+        Path("/content/drive/MyDrive/arxiv-metadata-oai-snapshot.json"),
+    ]
+    DATA_PATH = next((path for path in DATA_CANDIDATES if path.exists()), DATA_CANDIDATES[0])
+    ARTIFACT_DIR = Path("/content/artifacts/eda_full") if IS_COLAB else Path("artifacts/eda_full")
+    ARTIFACT_VERSION = 2
     RANDOM_SEED = 42
-    TEXT_ANALYSIS_SAMPLE = 20_000
-    SPLIT_SIMULATION_MIN_COUNT = 10
+    TOP_TOKEN_LIMIT = 2000
+    SPLIT_THRESHOLD_OPTIONS = (2, 3, 5, 10, 20)
+    REFRESH_ARTIFACTS = False
 
     assert DATA_PATH.exists(), f"Dataset not found: {DATA_PATH.resolve()}"
 
+    print(f"Running in Google Colab: {IS_COLAB}")
     print(f"Dataset: {DATA_PATH.resolve()}")
     print(f"Dataset size: {DATA_PATH.stat().st_size / 1024**3:,.2f} GB")
+    print(f"Artifact directory: {ARTIFACT_DIR.resolve()}")
     """
 )
 
 md(
     """
-    ## 2. Utilities
+    ## 2. Utilities and Artifact Build
 
-    The dataset is too large to load as a single in-memory dataframe without wasting memory. The helper functions below support a cache-first workflow:
+    The notebook is designed around a cache-first workflow. On the first run, it performs a full streaming pass over the raw dataset, computes the required summaries, and saves them in `artifacts/eda_full`. On later runs, those artifacts are reused immediately.
 
-    - if full-dataset EDA artifacts already exist, the notebook reuses them immediately,
-    - if not, the notebook can build them from scratch in a single streaming pass over the JSONL file, and
-    - text-heavy analysis is based on a fixed reservoir sample so the notebook stays fast enough to rerun.
-
-    The full cache build is the only expensive step in this notebook. On first run it can take several minutes because it scans all 2.96 million records.
+    This is the only expensive stage. It is intentionally front-loaded so the rest of the notebook remains presentation-quality and easy to rerun.
     """
 )
 
@@ -164,80 +179,291 @@ code(
     WS_RE = re.compile(r"\\s+")
     NON_ALNUM_SPACE_RE = re.compile(r"[^a-z0-9\\s]")
     TOKEN_RE = re.compile(r"[A-Za-z0-9_+\\-\\.']+")
+    HTML_RE = re.compile(r"<[^>]+>")
+    LATEX_RE = re.compile(r"\\\\[A-Za-z]+|\\$[^$]+\\$|\\\\\\(|\\\\\\)|\\\\\\[|\\\\\\]|\\\\begin\\{|\\\\end\\{")
+    URL_RE = re.compile(r"https?://|www\\.")
+    EMAIL_RE = re.compile(r"\\b[\\w.%-]+@[\\w.-]+\\.[A-Za-z]{2,}\\b")
+    EXCESS_PUNCT_RE = re.compile(r"[!?.,;:]{4,}")
+    WITHDRAWN_RE = re.compile(r"withdrawn|retracted", re.I)
+    NON_ASCII_RE = re.compile(r"[^\\x00-\\x7F]")
+    NEWLINE_RE = re.compile(r"\\n")
 
 
-    def normalize_ws(text: object) -> str:
+    def normalize_ws(text):
         if text is None:
             return ""
         return WS_RE.sub(" ", str(text)).strip()
 
 
-    def split_categories(value: object) -> list[str]:
+    def split_categories(value):
         text = normalize_ws(value)
         return text.split() if text else []
 
 
-    def get_domain(category: str) -> str:
+    def get_domain(category):
         if not category:
             return "unknown"
         return category.split(".", 1)[0]
 
 
-    def reservoir_update(sample: list[dict], item: dict, sample_size: int, seen_count: int, rng: random.Random) -> None:
-        if len(sample) < sample_size:
-            sample.append(item)
-            return
-        j = rng.randrange(seen_count)
-        if j < sample_size:
-            sample[j] = item
-
-
-    def counter_to_frame(counter: Counter, key_name: str, value_name: str = "count") -> pd.DataFrame:
+    def counter_to_frame(counter, key_name, value_name="count"):
         frame = pd.DataFrame(counter.items(), columns=[key_name, value_name])
         if not frame.empty:
             frame = frame.sort_values(value_name, ascending=False).reset_index(drop=True)
         return frame
 
 
-    def percentile_summary(values) -> dict[str, float]:
+    def percentile_summary(values):
         arr = np.asarray(values, dtype=np.float64)
         percentiles = [0, 25, 50, 75, 90, 95, 99, 100]
         return {str(p): float(np.percentile(arr, p)) for p in percentiles}
 
 
-    def clip_text(text: str, width: int = 220) -> str:
+    def clip_text(text, width=220):
         text = normalize_ws(text)
         return text if len(text) <= width else text[: width - 3] + "..."
 
 
-    def load_json(path: Path) -> dict:
+    def load_json(path):
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
 
-    def load_jsonl_gz(path: Path) -> list[dict]:
-        rows = []
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            for line in f:
-                rows.append(json.loads(line))
-        return rows
+    def update_smallest_examples(rows, row, metric_key, limit=4):
+        rows.append(row)
+        rows.sort(key=lambda item: (item.get(metric_key, 0), item.get("id", "")))
+        del rows[limit:]
+
+
+    def update_largest_examples(rows, row, metric_key, limit=4):
+        rows.append(row)
+        rows.sort(key=lambda item: (item.get(metric_key, 0), item.get("id", "")), reverse=True)
+        del rows[limit:]
+
+
+    def tokenize_raw_lower(text):
+        return [token.lower() for token in TOKEN_RE.findall(text)]
+
+
+    def tokenize_no_punct(text):
+        lowered = NON_ALNUM_SPACE_RE.sub(" ", text.lower())
+        return [token for token in WS_RE.split(lowered) if token]
+
+
+    def tokenize_no_punct_stop(text, stopwords):
+        return [token for token in tokenize_no_punct(text) if token not in stopwords]
     """
 )
 
 code(
     """
-    def build_eda_artifacts(
-        data_path: Path,
-        artifact_dir: Path,
-        seed: int = RANDOM_SEED,
-        text_sample_size: int = 40_000,
-        split_sample_size: int = 200_000,
-        progress_every: int = 250_000,
-    ) -> None:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+    def build_split_artifacts(primary_label_codes, code_to_label, artifact_dir, random_state=RANDOM_SEED):
+        labels = np.asarray(primary_label_codes, dtype=np.uint16)
+        label_counts = pd.Series(labels).value_counts().sort_index()
+        threshold_rows = []
 
-        rng_text = random.Random(seed)
-        rng_split = random.Random(seed + 1)
+        for threshold in SPLIT_THRESHOLD_OPTIONS:
+            eligible_codes = label_counts[label_counts >= threshold].index.to_numpy(dtype=np.uint16)
+            eligible = labels[np.isin(labels, eligible_codes)]
+            works = True
+            try:
+                train_tmp, heldout_tmp = train_test_split(
+                    eligible,
+                    test_size=0.30,
+                    random_state=random_state,
+                    stratify=eligible,
+                )
+                train_test_split(
+                    heldout_tmp,
+                    test_size=2 / 3,
+                    random_state=random_state,
+                    stratify=heldout_tmp,
+                )
+            except Exception:
+                works = False
+
+            threshold_rows.append(
+                {
+                    "minimum_count_per_primary_category": int(threshold),
+                    "eligible_rows": int(len(eligible)),
+                    "eligible_primary_categories": int(len(eligible_codes)),
+                    "stratified_70_10_20_feasible": bool(works),
+                }
+            )
+
+        threshold_df = pd.DataFrame(threshold_rows)
+        threshold_df.to_csv(artifact_dir / "split_threshold_summary.csv", index=False)
+
+        train_random, temp_random = train_test_split(labels, test_size=0.30, random_state=random_state)
+        val_random, test_random = train_test_split(temp_random, test_size=2 / 3, random_state=random_state)
+
+        train_strat, temp_strat = train_test_split(
+            labels,
+            test_size=0.30,
+            random_state=random_state,
+            stratify=labels,
+        )
+        val_strat, test_strat = train_test_split(
+            temp_strat,
+            test_size=2 / 3,
+            random_state=random_state,
+            stratify=temp_strat,
+        )
+
+        global_dist = pd.Series(labels).value_counts(normalize=True).sort_index()
+
+        def summarize_strategy(strategy_name, splits):
+            rows = []
+            drift_rows = []
+            for split_name, split_labels in splits.items():
+                split_dist = pd.Series(split_labels).value_counts(normalize=True).sort_index()
+                aligned = global_dist.to_frame("global_share").join(
+                    split_dist.to_frame("split_share"),
+                    how="left",
+                ).fillna(0)
+                aligned["abs_diff_pct_points"] = (aligned["split_share"] - aligned["global_share"]).abs() * 100
+
+                rows.append(
+                    {
+                        "strategy": strategy_name,
+                        "split": split_name,
+                        "size": int(len(split_labels)),
+                        "size_share_pct": float(len(split_labels) / len(labels) * 100),
+                        "mean_abs_diff_pct_points": float(aligned["abs_diff_pct_points"].mean()),
+                        "max_abs_diff_pct_points": float(aligned["abs_diff_pct_points"].max()),
+                        "missing_primary_categories": int((aligned["split_share"] == 0).sum()),
+                    }
+                )
+
+                for code_value, row in aligned.iterrows():
+                    drift_rows.append(
+                        {
+                            "strategy": strategy_name,
+                            "split": split_name,
+                            "primary_category": code_to_label[int(code_value)],
+                            "global_share_pct": float(row["global_share"] * 100),
+                            "split_share_pct": float(row["split_share"] * 100),
+                            "abs_diff_pct_points": float(row["abs_diff_pct_points"]),
+                        }
+                    )
+
+            return rows, drift_rows
+
+        random_rows, random_drift = summarize_strategy(
+            "Random",
+            {"Train": train_random, "Validation": val_random, "Test": test_random},
+        )
+        strat_rows, strat_drift = summarize_strategy(
+            "Stratified by primary category",
+            {"Train": train_strat, "Validation": val_strat, "Test": test_strat},
+        )
+
+        pd.DataFrame(random_rows + strat_rows).to_csv(artifact_dir / "split_strategy_summary.csv", index=False)
+        pd.DataFrame(random_drift + strat_drift).to_csv(artifact_dir / "split_drift_tables.csv", index=False)
+
+
+    def build_token_artifacts(data_path, artifact_dir, progress_every=150_000):
+        stopwords = set(ENGLISH_STOP_WORDS)
+        tokenizers = [
+            ("Raw lowercase tokenization", lambda text: tokenize_raw_lower(text)),
+            ("Lowercase + punctuation removal", lambda text: tokenize_no_punct(text)),
+            (
+                "Lowercase + punctuation removal + stopword removal",
+                lambda text: tokenize_no_punct_stop(text, stopwords),
+            ),
+        ]
+
+        token_metric_rows = []
+        top_token_rows = []
+
+        for config_name, tokenizer in tokenizers:
+            counter = Counter()
+            total_tokens = 0
+            stopword_tokens = 0
+            numeric_tokens = 0
+            punct_tokens = 0
+            start = time.time()
+
+            with data_path.open("r", encoding="utf-8") as f:
+                for idx, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
+
+                    record = json.loads(line)
+                    combined_text = f"{normalize_ws(record.get('title'))} {normalize_ws(record.get('abstract'))}".strip()
+                    if not combined_text:
+                        continue
+
+                    tokens = tokenizer(combined_text)
+                    counter.update(tokens)
+                    total_tokens += len(tokens)
+                    stopword_tokens += sum(token in stopwords for token in tokens)
+                    numeric_tokens += sum(any(ch.isdigit() for ch in token) for token in tokens)
+                    punct_tokens += sum(bool(re.search(r"[^\\w\\s]", token)) for token in tokens)
+
+                    if idx % progress_every == 0:
+                        elapsed = (time.time() - start) / 60
+                        print(f"[{config_name}] processed {idx:,} records in {elapsed:.1f} minutes")
+
+            counts = np.fromiter(counter.values(), dtype=np.int64)
+            vocab_size = int(len(counter))
+            hapax_count = int((counts == 1).sum()) if vocab_size else 0
+            rare_le2_count = int((counts <= 2).sum()) if vocab_size else 0
+            rare_le2_mass = int(counts[counts <= 2].sum()) if vocab_size else 0
+            common_ge1000_count = int((counts >= 1000).sum()) if vocab_size else 0
+            common_ge1000_mass = int(counts[counts >= 1000].sum()) if vocab_size else 0
+            top100_token_share = float(sum(count for _, count in counter.most_common(100)) / total_tokens * 100) if total_tokens else 0.0
+
+            token_metric_rows.append(
+                {
+                    "configuration": config_name,
+                    "vocab_size": vocab_size,
+                    "total_tokens": int(total_tokens),
+                    "hapax_vocab_pct": float(hapax_count / vocab_size * 100) if vocab_size else 0.0,
+                    "rare_le2_vocab_pct": float(rare_le2_count / vocab_size * 100) if vocab_size else 0.0,
+                    "rare_le2_token_mass_pct": float(rare_le2_mass / total_tokens * 100) if total_tokens else 0.0,
+                    "common_ge1000_vocab_pct": float(common_ge1000_count / vocab_size * 100) if vocab_size else 0.0,
+                    "common_ge1000_token_mass_pct": float(common_ge1000_mass / total_tokens * 100) if total_tokens else 0.0,
+                    "stopword_token_pct": float(stopword_tokens / total_tokens * 100) if total_tokens else 0.0,
+                    "numeric_token_pct": float(numeric_tokens / total_tokens * 100) if total_tokens else 0.0,
+                    "punct_token_pct": float(punct_tokens / total_tokens * 100) if total_tokens else 0.0,
+                    "top100_token_share_pct": top100_token_share,
+                }
+            )
+
+            for rank, (token, count) in enumerate(counter.most_common(TOP_TOKEN_LIMIT), start=1):
+                top_token_rows.append(
+                    {
+                        "configuration": config_name,
+                        "rank": int(rank),
+                        "token": token,
+                        "count": int(count),
+                    }
+                )
+
+        token_metrics_df = pd.DataFrame(token_metric_rows)
+        raw_vocab = token_metrics_df.loc[
+            token_metrics_df["configuration"] == "Raw lowercase tokenization",
+            "vocab_size",
+        ].iloc[0]
+        token_metrics_df["vocab_reduction_vs_raw_pct"] = (
+            1 - token_metrics_df["vocab_size"] / raw_vocab
+        ) * 100
+
+        token_metrics_df.to_csv(artifact_dir / "token_metrics.csv", index=False)
+        pd.DataFrame(top_token_rows).to_csv(artifact_dir / "token_top_terms.csv", index=False)
+
+
+    def build_eda_artifacts(
+        data_path,
+        artifact_dir,
+        artifact_version=ARTIFACT_VERSION,
+        seed=RANDOM_SEED,
+        preview_limit=5,
+        example_limit=4,
+        progress_every=150_000,
+    ):
+        artifact_dir.mkdir(parents=True, exist_ok=True)
 
         field_names = set()
         field_types = defaultdict(Counter)
@@ -261,9 +487,14 @@ code(
         primary_domain_year_counts = defaultdict(Counter)
         malformed_category_token_counts = Counter()
 
+        primary_domain_abstract_lengths = defaultdict(lambda: array("H"))
+        pattern_counts = Counter()
+
         preview_rows = []
-        text_sample = []
-        split_sample = []
+        normal_examples = []
+        problematic_examples = []
+        short_abstract_examples = []
+        long_abstract_examples = []
 
         suspect_id_count = 0
         invalid_submission_dates = 0
@@ -273,6 +504,10 @@ code(
         duplicate_paper_id_examples = []
         seen_ids = set()
 
+        primary_label_to_code = {}
+        code_to_primary_label = []
+        primary_label_codes = array("H")
+
         exact_title_hashes = array("Q")
         normalized_title_hashes = array("Q")
         content_hashes = array("Q")
@@ -280,20 +515,23 @@ code(
         title_word_lengths = array("I")
         abstract_char_lengths = array("I")
         abstract_word_lengths = array("I")
-        author_counts_array = array("I")
-        label_counts_array = array("I")
-        version_counts_array = array("I")
+        author_counts_array = array("H")
+        label_counts_array = array("B")
+        version_counts_array = array("H")
 
         start = time.time()
+        record_count = 0
+
         with data_path.open("r", encoding="utf-8") as f:
             for idx, line in enumerate(f, start=1):
                 if not line.strip():
                     continue
 
+                record_count = idx
                 record = json.loads(line)
                 field_names.update(record.keys())
 
-                if idx <= 5_000:
+                if idx <= 10_000:
                     for key, value in record.items():
                         field_types[key][type(value).__name__] += 1
 
@@ -317,8 +555,10 @@ code(
                 if paper_id and not ID_RE.match(paper_id):
                     suspect_id_count += 1
 
-                title = normalize_ws(record.get("title"))
-                abstract = normalize_ws(record.get("abstract"))
+                raw_title = str(record.get("title") or "")
+                raw_abstract = str(record.get("abstract") or "")
+                title = normalize_ws(raw_title)
+                abstract = normalize_ws(raw_abstract)
                 categories = split_categories(record.get("categories"))
                 primary_category = categories[0] if categories else ""
                 primary_domain = get_domain(primary_category) if primary_category else "unknown"
@@ -327,31 +567,40 @@ code(
                 author_count = len(authors_parsed) if isinstance(authors_parsed, list) else 0
                 version_count = len(record.get("versions") or []) if isinstance(record.get("versions"), list) else 0
 
-                title_char_lengths.append(len(title))
-                title_word_lengths.append(len(title.split()))
-                abstract_char_lengths.append(len(abstract))
-                abstract_word_lengths.append(len(abstract.split()))
+                title_char_len = len(title)
+                title_word_len = len(title.split())
+                abstract_char_len = len(abstract)
+                abstract_word_len = len(abstract.split())
+
+                title_char_lengths.append(title_char_len)
+                title_word_lengths.append(title_word_len)
+                abstract_char_lengths.append(abstract_char_len)
+                abstract_word_lengths.append(abstract_word_len)
                 author_counts_array.append(author_count)
                 label_counts_array.append(len(categories))
                 version_counts_array.append(version_count)
 
                 author_count_distribution[author_count] += 1
                 version_count_distribution[version_count] += 1
+                primary_domain_abstract_lengths[primary_domain].append(abstract_word_len)
 
-                exact_title_hash = int.from_bytes(
-                    hashlib.blake2b(title.encode("utf-8"), digest_size=8).digest(),
-                    "big",
-                ) if title else 0
+                exact_title_hash = (
+                    int.from_bytes(hashlib.blake2b(title.encode("utf-8"), digest_size=8).digest(), "big")
+                    if title
+                    else 0
+                )
                 normalized_title = normalize_ws(NON_ALNUM_SPACE_RE.sub(" ", title.lower())) if title else ""
-                normalized_title_hash = int.from_bytes(
-                    hashlib.blake2b(normalized_title.encode("utf-8"), digest_size=8).digest(),
-                    "big",
-                ) if normalized_title else 0
+                normalized_title_hash = (
+                    int.from_bytes(hashlib.blake2b(normalized_title.encode("utf-8"), digest_size=8).digest(), "big")
+                    if normalized_title
+                    else 0
+                )
                 content_text = f"{normalized_title}\\n{abstract.lower()}"
-                content_hash = int.from_bytes(
-                    hashlib.blake2b(content_text.encode("utf-8"), digest_size=8).digest(),
-                    "big",
-                ) if content_text.strip() else 0
+                content_hash = (
+                    int.from_bytes(hashlib.blake2b(content_text.encode("utf-8"), digest_size=8).digest(), "big")
+                    if content_text.strip()
+                    else 0
+                )
 
                 exact_title_hashes.append(exact_title_hash)
                 normalized_title_hashes.append(normalized_title_hash)
@@ -365,19 +614,22 @@ code(
                     label_count_distribution[len(categories)] += 1
                     if len(categories) > 1:
                         combo_counts[" | ".join(categories)] += 1
-                    malformed_category_token_counts.update(
-                        cat for cat in categories if not CATEGORY_RE.match(cat)
-                    )
+                    malformed_category_token_counts.update(cat for cat in categories if not CATEGORY_RE.match(cat))
+
+                    if primary_category not in primary_label_to_code:
+                        primary_label_to_code[primary_category] = len(code_to_primary_label)
+                        code_to_primary_label.append(primary_category)
+                    primary_label_codes.append(primary_label_to_code[primary_category])
                 else:
                     missing_primary_category += 1
 
-                versions = record.get("versions")
                 submission_year = None
+                versions = record.get("versions")
                 if isinstance(versions, list) and versions:
                     created = versions[0].get("created")
                     try:
                         submitted_at = parsedate_to_datetime(created)
-                        submission_year = submitted_at.year
+                        submission_year = int(submitted_at.year)
                         submission_year_counts[submission_year] += 1
                         submission_month_counts[f"{submitted_at.year:04d}-{submitted_at.month:02d}"] += 1
                     except Exception:
@@ -385,11 +637,12 @@ code(
                 else:
                     invalid_submission_dates += 1
 
-                update_date = normalize_ws(record.get("update_date"))
                 update_year = None
+                update_date = normalize_ws(record.get("update_date"))
                 if update_date:
                     try:
-                        update_year = int(update_date[:4])
+                        update_dt = datetime.strptime(update_date, "%Y-%m-%d")
+                        update_year = int(update_dt.year)
                         update_year_counts[update_year] += 1
                     except Exception:
                         invalid_update_dates += 1
@@ -402,25 +655,49 @@ code(
                         primary_category_year_counts[primary_category][submission_year] += 1
                         primary_domain_year_counts[primary_domain][submission_year] += 1
 
-                sample_row = {
+                issue_tags = []
+                if LATEX_RE.search(title):
+                    pattern_counts[("Title", "LaTeX-like markup")] += 1
+                    issue_tags.append("title-latex")
+                if NEWLINE_RE.search(raw_title):
+                    pattern_counts[("Title", "newline artifact")] += 1
+                    issue_tags.append("title-newline")
+                if HTML_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "HTML-like tag")] += 1
+                    issue_tags.append("html")
+                if LATEX_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "LaTeX-like markup")] += 1
+                    issue_tags.append("latex")
+                if URL_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "URL")] += 1
+                    issue_tags.append("url")
+                if EMAIL_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "Email address")] += 1
+                    issue_tags.append("email")
+                if EXCESS_PUNCT_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "Excess punctuation")] += 1
+                    issue_tags.append("punctuation")
+                if WITHDRAWN_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "Withdrawn / retracted wording")] += 1
+                    issue_tags.append("withdrawn")
+                if NON_ASCII_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "Non-ASCII character")] += 1
+                    issue_tags.append("non-ascii")
+                if NEWLINE_RE.search(raw_abstract):
+                    pattern_counts[("Abstract", "newline artifact")] += 1
+                    issue_tags.append("abstract-newline")
+
+                example_row = {
                     "id": paper_id,
-                    "title": title,
-                    "abstract": abstract,
-                    "categories": " ".join(categories),
                     "primary_category": primary_category,
                     "primary_domain": primary_domain,
-                    "submission_year": submission_year,
-                    "update_year": update_year,
-                    "author_count": author_count,
-                    "label_count": len(categories),
-                    "title_char_len": len(title),
-                    "title_word_len": len(title.split()),
-                    "abstract_char_len": len(abstract),
-                    "abstract_word_len": len(abstract.split()),
-                    "version_count": version_count,
+                    "title": title,
+                    "abstract_preview": clip_text(abstract, 280),
+                    "title_word_len": int(title_word_len),
+                    "abstract_word_len": int(abstract_word_len),
                 }
 
-                if len(preview_rows) < 5:
+                if len(preview_rows) < preview_limit:
                     preview_rows.append(
                         {
                             "id": paper_id,
@@ -428,51 +705,55 @@ code(
                             "categories": " ".join(categories),
                             "update_date": update_date,
                             "authors": normalize_ws(record.get("authors")),
-                            "abstract": clip_text(abstract, width=400),
+                            "abstract": clip_text(abstract, width=420),
                         }
                     )
 
-                reservoir_update(text_sample, sample_row, text_sample_size, idx, rng_text)
-                reservoir_update(
-                    split_sample,
-                    {
-                        "id": paper_id,
-                        "primary_category": primary_category,
-                        "primary_domain": primary_domain,
-                    },
-                    split_sample_size,
-                    idx,
-                    rng_split,
-                )
+                if (
+                    110 <= abstract_word_len <= 190
+                    and not issue_tags
+                    and len(normal_examples) < example_limit
+                ):
+                    normal_examples.append(example_row)
+
+                if issue_tags and len(problematic_examples) < example_limit:
+                    tagged = dict(example_row)
+                    tagged["issue_tags"] = ", ".join(issue_tags)
+                    problematic_examples.append(tagged)
+
+                if abstract_word_len > 0:
+                    update_smallest_examples(short_abstract_examples, example_row, "abstract_word_len", example_limit)
+                    update_largest_examples(long_abstract_examples, example_row, "abstract_word_len", example_limit)
 
                 if idx % progress_every == 0:
-                    elapsed = time.time() - start
-                    print(f"Processed {idx:,} records in {elapsed / 60:.1f} minutes")
+                    elapsed = (time.time() - start) / 60
+                    print(f"Processed {idx:,} records in {elapsed:.1f} minutes")
 
-        record_count = idx
         print(f"Finished full pass over {record_count:,} records.")
 
         np.savez_compressed(
             artifact_dir / "length_arrays.npz",
-            title_char_len=np.array(title_char_lengths, dtype=np.uint32),
-            title_word_len=np.array(title_word_lengths, dtype=np.uint32),
-            abstract_char_len=np.array(abstract_char_lengths, dtype=np.uint32),
-            abstract_word_len=np.array(abstract_word_lengths, dtype=np.uint32),
-            author_count=np.array(author_counts_array, dtype=np.uint16),
-            label_count=np.array(label_counts_array, dtype=np.uint8),
-            version_count=np.array(version_counts_array, dtype=np.uint8),
+            title_char_len=np.asarray(title_char_lengths, dtype=np.uint32),
+            title_word_len=np.asarray(title_word_lengths, dtype=np.uint16),
+            abstract_char_len=np.asarray(abstract_char_lengths, dtype=np.uint32),
+            abstract_word_len=np.asarray(abstract_word_lengths, dtype=np.uint16),
+            author_count=np.asarray(author_counts_array, dtype=np.uint16),
+            label_count=np.asarray(label_counts_array, dtype=np.uint8),
+            version_count=np.asarray(version_counts_array, dtype=np.uint16),
         )
 
         column_rows = []
         for field in sorted(field_names):
             type_counter = field_types.get(field, Counter())
             inferred_dtype = type_counter.most_common(1)[0][0] if type_counter else "unknown"
+            missing_count = int(missing_counts.get(field, 0))
             column_rows.append(
                 {
                     "column": field,
                     "inferred_dtype_sample": inferred_dtype,
-                    "missing_count": int(missing_counts.get(field, 0)),
-                    "missing_pct": float(missing_counts.get(field, 0) / record_count * 100),
+                    "missing_count": missing_count,
+                    "missing_pct": float(missing_count / record_count * 100),
+                    "non_null_count": int(record_count - missing_count),
                     "empty_string_count": int(empty_string_counts.get(field, 0)),
                     "whitespace_only_count": int(whitespace_only_counts.get(field, 0)),
                 }
@@ -516,7 +797,7 @@ code(
         for category, year_counts in primary_category_year_counts.items():
             for year, count in year_counts.items():
                 primary_category_year_rows.append(
-                    {"primary_category": category, "submission_year": year, "count": count}
+                    {"primary_category": category, "submission_year": year, "count": int(count)}
                 )
         pd.DataFrame(primary_category_year_rows).to_csv(
             artifact_dir / "primary_category_year_counts.csv",
@@ -527,7 +808,7 @@ code(
         for domain, year_counts in primary_domain_year_counts.items():
             for year, count in year_counts.items():
                 primary_domain_year_rows.append(
-                    {"primary_domain": domain, "submission_year": year, "count": count}
+                    {"primary_domain": domain, "submission_year": year, "count": int(count)}
                 )
         pd.DataFrame(primary_domain_year_rows).to_csv(
             artifact_dir / "primary_domain_year_counts.csv",
@@ -555,15 +836,57 @@ code(
             index=False,
         )
 
-        with gzip.open(artifact_dir / "text_sample.jsonl.gz", "wt", encoding="utf-8") as f:
-            for row in text_sample:
-                f.write(json.dumps(row, ensure_ascii=False) + "\\n")
+        pattern_rows = []
+        for (field_name, pattern_name), count in sorted(pattern_counts.items()):
+            pattern_rows.append(
+                {
+                    "field": field_name,
+                    "pattern": pattern_name,
+                    "count": int(count),
+                    "share_pct": float(count / record_count * 100),
+                }
+            )
+        pd.DataFrame(pattern_rows).sort_values(["field", "count"], ascending=[True, False]).to_csv(
+            artifact_dir / "text_artifact_patterns.csv",
+            index=False,
+        )
 
-        pd.DataFrame(split_sample).to_csv(artifact_dir / "split_sample.csv", index=False)
+        domain_length_rows = []
+        for domain, values in primary_domain_abstract_lengths.items():
+            if not values:
+                continue
+            domain_length_rows.append(
+                {
+                    "primary_domain": domain,
+                    "paper_count": int(len(values)),
+                    "p25_abstract_words": float(np.percentile(values, 25)),
+                    "median_abstract_words": float(np.percentile(values, 50)),
+                    "p75_abstract_words": float(np.percentile(values, 75)),
+                    "p90_abstract_words": float(np.percentile(values, 90)),
+                }
+            )
+        pd.DataFrame(domain_length_rows).sort_values("paper_count", ascending=False).to_csv(
+            artifact_dir / "domain_abstract_length_summary.csv",
+            index=False,
+        )
+
         with (artifact_dir / "preview_rows.json").open("w", encoding="utf-8") as f:
             json.dump(preview_rows, f, ensure_ascii=False, indent=2)
 
-        def summarize_hash_duplicates(hash_values: array) -> dict:
+        with (artifact_dir / "example_rows.json").open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "normal_examples": normal_examples,
+                    "problematic_examples": problematic_examples,
+                    "short_abstract_examples": short_abstract_examples,
+                    "long_abstract_examples": long_abstract_examples,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        def summarize_hash_duplicates(hash_values):
             arr = np.asarray(hash_values, dtype=np.uint64)
             unique_hashes, counts = np.unique(arr, return_counts=True)
             duplicate_mask = counts > 1
@@ -600,6 +923,7 @@ code(
             for line in f:
                 if not line.strip():
                     continue
+
                 record = json.loads(line)
                 title = normalize_ws(record.get("title"))
                 abstract = normalize_ws(record.get("abstract"))
@@ -610,20 +934,23 @@ code(
                     "categories": categories,
                     "abstract_preview": clip_text(abstract, width=300),
                 }
-                exact_hash = int.from_bytes(
-                    hashlib.blake2b(title.encode("utf-8"), digest_size=8).digest(),
-                    "big",
-                ) if title else 0
+                exact_hash = (
+                    int.from_bytes(hashlib.blake2b(title.encode("utf-8"), digest_size=8).digest(), "big")
+                    if title
+                    else 0
+                )
                 normalized_title = normalize_ws(NON_ALNUM_SPACE_RE.sub(" ", title.lower())) if title else ""
-                norm_hash = int.from_bytes(
-                    hashlib.blake2b(normalized_title.encode("utf-8"), digest_size=8).digest(),
-                    "big",
-                ) if normalized_title else 0
+                norm_hash = (
+                    int.from_bytes(hashlib.blake2b(normalized_title.encode("utf-8"), digest_size=8).digest(), "big")
+                    if normalized_title
+                    else 0
+                )
                 content_text = f"{normalized_title}\\n{abstract.lower()}"
-                content_hash = int.from_bytes(
-                    hashlib.blake2b(content_text.encode("utf-8"), digest_size=8).digest(),
-                    "big",
-                ) if content_text.strip() else 0
+                content_hash = (
+                    int.from_bytes(hashlib.blake2b(content_text.encode("utf-8"), digest_size=8).digest(), "big")
+                    if content_text.strip()
+                    else 0
+                )
 
                 if exact_hash in top_hash_lookup["exact_title"] and str(exact_hash) not in duplicate_examples["exact_title"]:
                     duplicate_examples["exact_title"][str(exact_hash)] = example
@@ -632,11 +959,25 @@ code(
                 if content_hash in top_hash_lookup["title_abstract_content"] and str(content_hash) not in duplicate_examples["title_abstract_content"]:
                     duplicate_examples["title_abstract_content"][str(content_hash)] = example
 
+        with (artifact_dir / "duplicate_examples.json").open("w", encoding="utf-8") as f:
+            json.dump(duplicate_examples, f, ensure_ascii=False, indent=2)
+
+        recent_2018_share = (
+            float(submission_year_df.loc[submission_year_df["submission_year"] >= 2018, "count"].sum() / record_count * 100)
+            if not submission_year_df.empty
+            else 0.0
+        )
+        recent_2020_share = (
+            float(submission_year_df.loc[submission_year_df["submission_year"] >= 2020, "count"].sum() / record_count * 100)
+            if not submission_year_df.empty
+            else 0.0
+        )
+
         summary = {
+            "artifact_version": int(artifact_version),
             "data_path": str(data_path),
             "record_count": int(record_count),
             "field_names": sorted(field_names),
-            "preview_row_count": len(preview_rows),
             "unique_all_categories": int(len(all_category_counts)),
             "unique_primary_categories": int(len(primary_category_counts)),
             "unique_primary_domains": int(len(primary_domain_counts)),
@@ -655,6 +996,8 @@ code(
             "multi_label_share_pct": float(label_count_df.loc[label_count_df["label_count"] > 1, "share_pct"].sum()) if not label_count_df.empty else 0.0,
             "rare_primary_categories_le_10": int((primary_category_df["count"] <= 10).sum()) if not primary_category_df.empty else 0,
             "rare_primary_categories_le_50": int((primary_category_df["count"] <= 50).sum()) if not primary_category_df.empty else 0,
+            "recent_2018_share_pct": recent_2018_share,
+            "recent_2020_share_pct": recent_2020_share,
             "length_percentiles": {
                 "title_char_len": percentile_summary(title_char_lengths),
                 "title_word_len": percentile_summary(title_word_lengths),
@@ -667,38 +1010,57 @@ code(
             "duplicate_summary": duplicate_summary,
         }
 
-        with (artifact_dir / "duplicate_examples.json").open("w", encoding="utf-8") as f:
-            json.dump(duplicate_examples, f, ensure_ascii=False, indent=2)
         with (artifact_dir / "summary.json").open("w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
+        build_split_artifacts(primary_label_codes, code_to_primary_label, artifact_dir)
+        build_token_artifacts(data_path, artifact_dir)
 
-    def ensure_eda_artifacts(data_path: Path, artifact_dir: Path, refresh: bool = False) -> None:
+
+    def ensure_eda_artifacts(data_path, artifact_dir, refresh=False):
         required = [
             artifact_dir / "summary.json",
             artifact_dir / "column_overview.csv",
+            artifact_dir / "all_category_counts.csv",
             artifact_dir / "primary_category_counts.csv",
             artifact_dir / "primary_domain_counts.csv",
+            artifact_dir / "label_count_distribution.csv",
             artifact_dir / "submission_year_counts.csv",
             artifact_dir / "length_arrays.npz",
-            artifact_dir / "text_sample.jsonl.gz",
-            artifact_dir / "split_sample.csv",
+            artifact_dir / "text_artifact_patterns.csv",
+            artifact_dir / "domain_abstract_length_summary.csv",
+            artifact_dir / "token_metrics.csv",
+            artifact_dir / "token_top_terms.csv",
+            artifact_dir / "split_threshold_summary.csv",
+            artifact_dir / "split_strategy_summary.csv",
+            artifact_dir / "split_drift_tables.csv",
+            artifact_dir / "example_rows.json",
         ]
-        if refresh or not all(path.exists() for path in required):
-            print("Building EDA artifacts from the raw JSONL dataset. This may take several minutes.")
+
+        summary_path = artifact_dir / "summary.json"
+        needs_build = refresh or not all(path.exists() for path in required)
+
+        if not needs_build and summary_path.exists():
+            current_summary = load_json(summary_path)
+            if current_summary.get("artifact_version") != ARTIFACT_VERSION:
+                needs_build = True
+
+        if needs_build:
+            print("Building full-dataset EDA artifacts. This can take a while on the first run.")
             build_eda_artifacts(data_path, artifact_dir)
         else:
-            print(f"Using cached EDA artifacts from {artifact_dir.resolve()}")
+            print(f"Using cached full-dataset EDA artifacts from {artifact_dir.resolve()}")
     """
 )
 
 code(
     """
-    ensure_eda_artifacts(DATA_PATH, ARTIFACT_DIR, refresh=False)
+    ensure_eda_artifacts(DATA_PATH, ARTIFACT_DIR, refresh=REFRESH_ARTIFACTS)
 
     summary = load_json(ARTIFACT_DIR / "summary.json")
-    duplicate_examples = load_json(ARTIFACT_DIR / "duplicate_examples.json")
     preview_df = pd.DataFrame(load_json(ARTIFACT_DIR / "preview_rows.json"))
+    example_rows = load_json(ARTIFACT_DIR / "example_rows.json")
+    duplicate_examples = load_json(ARTIFACT_DIR / "duplicate_examples.json")
 
     column_overview = pd.read_csv(ARTIFACT_DIR / "column_overview.csv")
     all_category_counts = pd.read_csv(ARTIFACT_DIR / "all_category_counts.csv")
@@ -709,14 +1071,21 @@ code(
     category_combinations = pd.read_csv(ARTIFACT_DIR / "category_combination_counts_top200.csv")
     submission_year_counts = pd.read_csv(ARTIFACT_DIR / "submission_year_counts.csv")
     submission_month_counts = pd.read_csv(ARTIFACT_DIR / "submission_month_counts.csv")
+    primary_category_year_counts = pd.read_csv(ARTIFACT_DIR / "primary_category_year_counts.csv")
     primary_domain_year_counts = pd.read_csv(ARTIFACT_DIR / "primary_domain_year_counts.csv")
     author_count_distribution = pd.read_csv(ARTIFACT_DIR / "author_count_distribution.csv")
+    version_count_distribution = pd.read_csv(ARTIFACT_DIR / "version_count_distribution.csv")
     update_lag_distribution = pd.read_csv(ARTIFACT_DIR / "update_lag_year_distribution.csv")
     malformed_category_tokens = pd.read_csv(ARTIFACT_DIR / "malformed_category_tokens.csv")
-    split_sample_df = pd.read_csv(ARTIFACT_DIR / "split_sample.csv")
-    text_sample_df = pd.DataFrame(load_jsonl_gz(ARTIFACT_DIR / "text_sample.jsonl.gz"))
-    length_arrays = np.load(ARTIFACT_DIR / "length_arrays.npz")
+    text_artifact_patterns = pd.read_csv(ARTIFACT_DIR / "text_artifact_patterns.csv")
+    domain_abstract_length_summary = pd.read_csv(ARTIFACT_DIR / "domain_abstract_length_summary.csv")
+    token_metrics = pd.read_csv(ARTIFACT_DIR / "token_metrics.csv")
+    token_top_terms = pd.read_csv(ARTIFACT_DIR / "token_top_terms.csv")
+    split_threshold_summary = pd.read_csv(ARTIFACT_DIR / "split_threshold_summary.csv")
+    split_strategy_summary = pd.read_csv(ARTIFACT_DIR / "split_strategy_summary.csv")
+    split_drift_tables = pd.read_csv(ARTIFACT_DIR / "split_drift_tables.csv")
 
+    length_arrays = np.load(ARTIFACT_DIR / "length_arrays.npz")
     title_char_len = length_arrays["title_char_len"]
     title_word_len = length_arrays["title_word_len"]
     abstract_char_len = length_arrays["abstract_char_len"]
@@ -725,9 +1094,8 @@ code(
     label_count_arr = length_arrays["label_count"]
     version_count_arr = length_arrays["version_count"]
 
-    print(f"Loaded cached summaries for {summary['record_count']:,} papers.")
-    print(f"Text sample size: {len(text_sample_df):,}")
-    print(f"Split simulation sample size: {len(split_sample_df):,}")
+    print(f"Loaded full-dataset summaries for {summary['record_count']:,} papers.")
+    print(f"Artifact directory: {ARTIFACT_DIR.resolve()}")
     """
 )
 
@@ -735,11 +1103,39 @@ md("## 3. Data Loading")
 
 md(
     """
-    The raw corpus is stored as a large JSONL file. Rather than loading the full file into a dataframe, this notebook works from cached full-dataset summaries and a reproducible reservoir sample for text-intensive analyses. This keeps the notebook memory-conscious without sacrificing coverage on the metadata-level analyses that matter most for the benchmark.
+    The raw corpus is stored as a JSON Lines file, with one paper per row. The notebook does not try to materialize the full file as one in-memory dataframe. Instead, it uses a streaming artifact build so the EDA remains reproducible while still covering the **entire dataset**.
+
+    The table below makes the scope explicit.
+    """
+)
+
+code(
+    """
+    analysis_scope = pd.DataFrame(
+        [
+            ("Core metadata counts and completeness", "Full dataset", "Exact"),
+            ("Category and domain distributions", "Full dataset", "Exact"),
+            ("Text-length distributions", "Full dataset", "Exact"),
+            ("Text artifact prevalence", "Full dataset", "Exact"),
+            ("Token and vocabulary analysis", "Full dataset", "Exact, cached after first run"),
+            ("Split strategy comparison", "Full dataset", "Exact"),
+            ("Displayed paper examples", "Selected representative rows", "For readability only"),
+            ("Recommended Colab runtime", "High-RAM preferred", "GPU optional for EDA"),
+        ],
+        columns=["Analysis block", "Coverage", "Computation mode"],
+    )
+
+    display(analysis_scope)
     """
 )
 
 md("## 4. Dataset Overview")
+
+md(
+    """
+    This section establishes the scale and schema of the corpus, identifies the columns most relevant to topic discovery, and shows a small set of representative rows for orientation.
+    """
+)
 
 code(
     """
@@ -749,30 +1145,30 @@ code(
             ("Unique primary categories", f"{summary['unique_primary_categories']:,}"),
             ("Unique categories across all labels", f"{summary['unique_all_categories']:,}"),
             ("Unique primary domains", f"{summary['unique_primary_domains']:,}"),
-            ("Date coverage", f"{submission_year_counts['submission_year'].min()} to {submission_year_counts['submission_year'].max()}"),
+            ("Submission-year range", f"{submission_year_counts['submission_year'].min()} to {submission_year_counts['submission_year'].max()}"),
             ("Dataset file size", f"{DATA_PATH.stat().st_size / 1024**3:,.2f} GB"),
-            ("Text analysis sample", f"{len(text_sample_df):,} papers"),
-            ("Split simulation sample", f"{len(split_sample_df):,} papers"),
+            ("Artifact cache", str(ARTIFACT_DIR)),
+            ("EDA scope", "Whole dataset"),
         ],
         columns=["Metric", "Value"],
     )
 
     column_roles = pd.DataFrame(
         [
-            ("id", "Unique paper identifier used for deduplication and joins", "High"),
-            ("title", "Short scientific summary; useful for lightweight retrieval and combined text representations", "High"),
-            ("abstract", "Main textual field for embeddings and clustering", "High"),
-            ("categories", "Multi-label arXiv subject assignments; first token is the primary label", "High"),
-            ("authors", "Raw author string; useful mainly for descriptive metadata", "Medium"),
-            ("authors_parsed", "Structured author list; enables author-count analysis", "Medium"),
-            ("versions", "Version history; first entry provides an effective submission date", "High"),
-            ("update_date", "Latest update date; useful for temporal skew and revision lag", "High"),
-            ("comments", "Optional free-text notes; potentially noisy", "Low"),
-            ("journal-ref", "Optional publication metadata; incomplete", "Low"),
-            ("doi", "Optional publication identifier; incomplete", "Low"),
-            ("report-no", "Optional report number; extremely sparse", "Low"),
-            ("license", "Usage license metadata; informative but not central for clustering", "Low"),
-            ("submitter", "Submission contact; not central for topic discovery", "Low"),
+            ("id", "Stable paper identifier used for deduplication, joins, and downstream indexing", "High"),
+            ("title", "Compact scientific description; useful for retrieval and title+abstract embeddings", "High"),
+            ("abstract", "Main text field for embeddings and clustering", "High"),
+            ("categories", "arXiv category assignments; first category acts as the primary label", "High"),
+            ("versions", "Version history; first version provides an effective submission timestamp", "High"),
+            ("update_date", "Last metadata update; useful for revision lag and temporal skew", "High"),
+            ("authors", "Raw author string for descriptive metadata only", "Medium"),
+            ("authors_parsed", "Structured author list; supports author-count analysis", "Medium"),
+            ("comments", "Optional notes that may contain noisy free text", "Low"),
+            ("journal-ref", "Optional publication venue metadata; sparse and secondary", "Low"),
+            ("doi", "Optional publication identifier; useful for enrichment, not clustering", "Low"),
+            ("report-no", "Optional report number; sparse", "Low"),
+            ("license", "Usage metadata; informative but not central to this benchmark", "Low"),
+            ("submitter", "Submission contact metadata; not relevant for topic discovery", "Low"),
         ],
         columns=["Column", "Interpretation", "Project relevance"],
     )
@@ -789,7 +1185,7 @@ code(
     display(
         Markdown(
             f'''
-    **Interpretation.** The corpus contains **{summary['record_count']:,} papers** with a stable 14-column schema. The fields that matter most for the benchmark are fully available: `id`, `title`, `abstract`, `categories`, `versions`, and `update_date` all have complete coverage in the cached summary. Optional bibliographic enrichment fields exist, but they are secondary for embedding and clustering experiments.
+    **Interpretation.** The corpus contains **{summary['record_count']:,} papers** and a stable 14-column schema. The fields that matter most for our benchmark are the textual and label-bearing fields: `title`, `abstract`, `categories`, `versions`, and `update_date`. This is a good fit for topic discovery because the dataset combines rich scientific text with externally assigned category labels that can be used as a reference signal for evaluation.
     '''
         )
     )
@@ -800,16 +1196,18 @@ md("## 5. Data Quality Assessment")
 
 md(
     """
-    This section focuses on issues that could distort downstream embeddings, clustering, or evaluation. The most relevant risks are missing core text, duplicate or near-duplicate records, malformed metadata, and pathological text lengths.
+    We focus on quality issues that are genuinely relevant to embeddings, clustering, and evaluation: missing core fields, duplicates, malformed metadata, and pathological text lengths.
     """
 )
 
 code(
     """
+    key_columns = ["id", "title", "abstract", "categories", "versions", "update_date", "authors", "authors_parsed", "doi", "journal-ref"]
+    missing_plot = column_overview[column_overview["column"].isin(key_columns)].sort_values("missing_pct", ascending=False)
+
     fig, ax = plt.subplots(figsize=(10, 5))
-    missing_plot = column_overview.sort_values("missing_pct", ascending=False)
     sns.barplot(data=missing_plot, x="missing_pct", y="column", hue="column", palette="crest", legend=False, ax=ax)
-    ax.set_title("Missing Values by Column")
+    ax.set_title("Missingness in Key Dataset Fields")
     ax.set_xlabel("Missing values (%)")
     ax.set_ylabel("")
     plt.tight_layout()
@@ -817,25 +1215,22 @@ code(
 
     quality_summary = pd.DataFrame(
         [
-            ("Duplicate paper IDs", summary["duplicate_paper_ids"], "Exact identifier collisions that should be removed before splitting."),
+            ("Duplicate paper IDs", summary["duplicate_paper_ids"], "Exact identifier collisions should be removed before splitting."),
             ("Exact duplicate title records", summary["duplicate_summary"]["exact_title"]["duplicate_records"], "Repeated titles can artificially tighten clusters."),
-            ("Near-duplicate titles (normalized)", summary["duplicate_summary"]["normalized_title"]["duplicate_records"], "Case/punctuation variants that can still duplicate content."),
-            ("Duplicate title+abstract records", summary["duplicate_summary"]["title_abstract_content"]["duplicate_records"], "A stronger proxy for repeated content."),
-            ("Invalid submission dates", summary["invalid_submission_dates"], "Temporal analysis is reliable if this remains near zero."),
-            ("Invalid update dates", summary["invalid_update_dates"], "Revision-lag analysis depends on this field."),
-            ("Malformed category tokens", int(malformed_category_tokens["count"].sum()) if not malformed_category_tokens.empty else 0, "Formatting inconsistencies would complicate label parsing."),
-            ("Very short abstracts (<= 10 words)", int((abstract_word_len <= 10).sum()), "Often withdrawn or placeholder-style records."),
-            ("Very long abstracts (>= 300 words)", int((abstract_word_len >= 300).sum()), "Can dominate token-based baselines and increase embedding cost."),
-            ("Very short titles (<= 3 words)", int((title_word_len <= 3).sum()), "Often too ambiguous to be used alone."),
+            ("Near-duplicate normalized titles", summary["duplicate_summary"]["normalized_title"]["duplicate_records"], "Case and punctuation variants still indicate repeated content."),
+            ("Duplicate title+abstract records", summary["duplicate_summary"]["title_abstract_content"]["duplicate_records"], "Repeated content can inflate retrieval and clustering metrics."),
+            ("Invalid submission dates", summary["invalid_submission_dates"], "Temporal analyses depend on reliable submission timestamps."),
+            ("Invalid update dates", summary["invalid_update_dates"], "Revision-lag analysis depends on parsable update dates."),
+            ("Malformed category tokens", int(malformed_category_tokens["count"].sum()) if not malformed_category_tokens.empty else 0, "Formatting anomalies complicate label parsing."),
+            ("Very short abstracts (<= 10 words)", int((abstract_word_len <= 10).sum()), "Often placeholders, withdrawn records, or unusable modeling inputs."),
+            ("Very long abstracts (>= 300 words)", int((abstract_word_len >= 300).sum()), "Increase token-baseline sparsity and embedding cost."),
+            ("Very short titles (<= 3 words)", int((title_word_len <= 3).sum()), "Too ambiguous to stand alone as topic signals."),
         ],
         columns=["Check", "Count", "Why it matters"],
     )
 
-    display(quality_summary)
-
     duplicate_title_example_rows = []
-    exact_top = summary["duplicate_summary"]["exact_title"]["top_hashes"][:5]
-    for item in exact_top:
+    for item in summary["duplicate_summary"]["exact_title"]["top_hashes"][:5]:
         example = duplicate_examples["exact_title"].get(str(item["hash"]), {})
         duplicate_title_example_rows.append(
             {
@@ -846,22 +1241,19 @@ code(
             }
         )
 
+    display(quality_summary)
     display(pd.DataFrame(duplicate_title_example_rows))
     """
 )
 
 code(
     """
-    core_text_ok = (
-        column_overview.loc[column_overview["column"].isin(["title", "abstract", "categories", "update_date"]), "missing_count"].sum() == 0
-    )
-
     display(
         Markdown(
             f'''
-    **Interpretation.** Core analytical fields are in strong shape: missingness is concentrated in optional bibliographic metadata such as `journal-ref`, `doi`, and `report-no`, not in the text or category fields used for the benchmark. The main quality risks are therefore **duplicate or near-duplicate content** and **pathologically short abstracts**, not missing text.
+    **Interpretation.** The core modeling fields are structurally strong: missingness is concentrated in optional enrichment fields such as `journal-ref` and `doi`, not in `title`, `abstract`, or `categories`. The main quality concerns are therefore **duplicate or near-duplicate records** and **degenerate short abstracts**, both of which can bias clustering and make retrieval quality look better than it really is.
 
-    The duplicate checks found **{summary['duplicate_paper_ids']} duplicate paper IDs**, **{summary['duplicate_summary']['exact_title']['duplicate_records']:,} exact duplicate-title records**, and **{summary['duplicate_summary']['title_abstract_content']['duplicate_records']:,} duplicate title-plus-abstract records**. These should be removed or consolidated before final experiments to avoid inflated cluster purity and overly optimistic retrieval behavior.
+    The duplicate checks found **{summary['duplicate_paper_ids']} duplicate paper IDs**, **{summary['duplicate_summary']['normalized_title']['duplicate_records']:,} normalized-title duplicates**, and **{summary['duplicate_summary']['title_abstract_content']['duplicate_records']:,} duplicate title-plus-abstract records**. These should be filtered before final benchmarking.
     '''
         )
     )
@@ -872,14 +1264,14 @@ md("## 6. Category and Domain Analysis")
 
 md(
     """
-    Category imbalance matters directly for the benchmark because arXiv labels will be used as an external reference for cluster evaluation. We therefore inspect both the fine-grained primary categories and their coarser domain groupings.
+    Because arXiv categories will be used as reference labels for evaluating clustering quality, the label space deserves careful treatment. We examine the head, the tail, the multi-label structure, and the broader domain mix.
     """
 )
 
 code(
     """
     top20_primary = primary_category_counts.head(20).sort_values("count", ascending=True)
-    top15_domains = primary_domain_counts.head(15).sort_values("count", ascending=True)
+    top12_domains = primary_domain_counts.head(12).sort_values("count", ascending=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     sns.barplot(data=top20_primary, x="count", y="primary_category", hue="primary_category", palette="mako", legend=False, ax=axes[0])
@@ -887,7 +1279,7 @@ code(
     axes[0].set_xlabel("Paper count")
     axes[0].set_ylabel("")
 
-    sns.barplot(data=top15_domains, x="count", y="primary_domain", hue="primary_domain", palette="crest", legend=False, ax=axes[1])
+    sns.barplot(data=top12_domains, x="count", y="primary_domain", hue="primary_domain", palette="crest", legend=False, ax=axes[1])
     axes[1].set_title("Primary Domain Distribution")
     axes[1].set_xlabel("Paper count")
     axes[1].set_ylabel("")
@@ -906,13 +1298,13 @@ code(
     rank_df["cumulative_share_pct"] = rank_df["count"].cumsum() / rank_df["count"].sum() * 100
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    axes[0].plot(rank_df["rank"], rank_df["count"], color="#0f766e", linewidth=2)
+    axes[0].plot(rank_df["rank"], rank_df["count"], color="#0f766e", linewidth=2.2)
     axes[0].set_yscale("log")
     axes[0].set_title("Primary Category Frequency by Rank")
     axes[0].set_xlabel("Category rank")
     axes[0].set_ylabel("Paper count (log scale)")
 
-    axes[1].plot(rank_df["rank"], rank_df["cumulative_share_pct"], color="#b45309", linewidth=2)
+    axes[1].plot(rank_df["rank"], rank_df["cumulative_share_pct"], color="#b45309", linewidth=2.2)
     for cutoff in [10, 20, 50, 100]:
         share = rank_df.loc[rank_df["rank"] <= cutoff, "count"].sum() / rank_df["count"].sum() * 100
         axes[1].axvline(cutoff, color="gray", linestyle="--", alpha=0.5)
@@ -929,19 +1321,21 @@ code(
 
 code(
     """
+    least_frequent = primary_category_counts.tail(10).sort_values("count", ascending=True)
+    only_secondary_categories = sorted(set(all_category_counts["category"]) - set(primary_category_counts["primary_category"]))
+
     fig, ax = plt.subplots(figsize=(10, 5))
     sns.barplot(data=label_count_distribution, x="label_count", y="share_pct", hue="label_count", palette="rocket", legend=False, ax=ax)
-    ax.set_title("Number of Categories Assigned per Paper")
-    ax.set_xlabel("Labels attached to a paper")
+    ax.set_title("Number of Category Labels Assigned per Paper")
+    ax.set_xlabel("Labels per paper")
     ax.set_ylabel("Share of papers (%)")
     plt.tight_layout()
     plt.show()
 
-    only_secondary_categories = sorted(set(all_category_counts["category"]) - set(primary_category_counts["primary_category"]))
-
     display(label_count_distribution)
     display(category_combinations.head(15))
-    print("Categories that appear only as secondary labels:", only_secondary_categories)
+    display(least_frequent)
+    print("Categories appearing only as secondary labels:", only_secondary_categories)
     """
 )
 
@@ -954,9 +1348,9 @@ code(
     display(
         Markdown(
             f'''
-    **Interpretation.** The label space is both **broad** and **imbalanced**. There are **{summary['unique_primary_categories']} primary categories** for evaluation, while the broader multi-label vocabulary spans **{summary['unique_all_categories']} labels**. The top primary category covers only **{summary['top_primary_category_share_pct']:.2f}%** of the corpus, but concentration accumulates quickly: the **top 10 primary categories already cover {top10_share:.1f}%** of papers, and the **top 50 cover {top50_share:.1f}%**.
+    **Interpretation.** The label space is broad and distinctly long-tailed. There are **{summary['unique_primary_categories']} primary categories** and **{summary['unique_all_categories']} categories across all labels**. The single largest primary category covers only **{summary['top_primary_category_share_pct']:.2f}%** of the corpus, but concentration still accumulates quickly: the **top 10 primary categories cover {top10_share:.1f}%** of all papers and the **top 50 cover {top50_share:.1f}%**.
 
-    Multi-label structure is not a corner case. Roughly **{summary['multi_label_share_pct']:.1f}%** of papers have more than one category, which means a single-label evaluation view will sometimes understate cross-disciplinary structure. For splitting and evaluation, the most defensible default is to stratify on the **primary category** while keeping the full multi-label assignments for error analysis and interpretation.
+    Multi-label structure is also substantial. Roughly **{summary['multi_label_share_pct']:.1f}%** of papers carry more than one category label. That means primary-category evaluation is useful, but it does not capture all cross-disciplinary structure. For the benchmark, the most defensible default is to stratify and evaluate on the **primary category** while retaining the full category string for error analysis and interpretation.
     '''
         )
     )
@@ -967,42 +1361,32 @@ md("## 7. Text Field Analysis")
 
 md(
     """
-    Embedding quality depends heavily on how scientific text behaves in practice. Here we examine title and abstract lengths, inspect text artifacts, and look at representative examples of normal, short, long, and problematic abstracts.
+    Topic discovery quality depends strongly on the text fields we embed. We therefore analyze title and abstract lengths, measure markup and artifact prevalence on the full dataset, and review representative examples drawn from the corpus.
     """
 )
 
 code(
     """
-    length_percentile_table = pd.DataFrame(
-        {
-            "title_char_len": summary["length_percentiles"]["title_char_len"],
-            "title_word_len": summary["length_percentiles"]["title_word_len"],
-            "abstract_char_len": summary["length_percentiles"]["abstract_char_len"],
-            "abstract_word_len": summary["length_percentiles"]["abstract_word_len"],
-        }
-    ).rename_axis("percentile").reset_index()
-
-    rng = np.random.default_rng(RANDOM_SEED)
-    plot_size = min(200_000, len(abstract_word_len))
-    abstract_word_plot = rng.choice(abstract_word_len, size=plot_size, replace=False)
-    abstract_char_plot = rng.choice(abstract_char_len, size=plot_size, replace=False)
-    title_word_plot = rng.choice(title_word_len, size=plot_size, replace=False)
-    title_char_plot = rng.choice(title_char_len, size=plot_size, replace=False)
+    length_percentile_table = (
+        pd.DataFrame(summary["length_percentiles"])
+        .rename_axis("percentile")
+        .reset_index()
+    )
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    sns.histplot(title_char_plot, bins=50, ax=axes[0, 0], color="#0f766e")
+    axes[0, 0].hist(title_char_len, bins=50, color="#0f766e")
     axes[0, 0].set_title("Title Length in Characters")
     axes[0, 0].set_xlabel("Characters")
 
-    sns.histplot(title_word_plot, bins=40, ax=axes[0, 1], color="#2563eb")
+    axes[0, 1].hist(title_word_len, bins=40, color="#2563eb")
     axes[0, 1].set_title("Title Length in Words")
     axes[0, 1].set_xlabel("Words")
 
-    sns.histplot(abstract_char_plot, bins=60, ax=axes[1, 0], color="#b45309")
+    axes[1, 0].hist(abstract_char_len, bins=60, color="#b45309")
     axes[1, 0].set_title("Abstract Length in Characters")
     axes[1, 0].set_xlabel("Characters")
 
-    sns.histplot(abstract_word_plot, bins=60, ax=axes[1, 1], color="#7c3aed")
+    axes[1, 1].hist(abstract_word_len, bins=60, color="#7c3aed")
     axes[1, 1].set_title("Abstract Length in Words")
     axes[1, 1].set_xlabel("Words")
 
@@ -1015,63 +1399,72 @@ code(
 
 code(
     """
-    HTML_RE = re.compile(r"<[^>]+>")
-    LATEX_RE = re.compile(r"\\\\[A-Za-z]+|\\$[^$]+\\$|\\\\\\(|\\\\\\)|\\\\\\[|\\\\\\]|\\\\begin\\{|\\\\end\\{")
-    URL_RE = re.compile(r"https?://|www\\.")
-    EMAIL_RE = re.compile(r"\\b[\\w.%-]+@[\\w.-]+\\.[A-Za-z]{2,}\\b")
-    EXCESS_PUNCT_RE = re.compile(r"[!?.,;:]{4,}")
-    WITHDRAWN_RE = re.compile(r"withdrawn|retracted", re.I)
-    NON_ASCII_RE = re.compile(r"[^\\x00-\\x7F]")
-
-
-    def pattern_share(series: pd.Series, pattern: re.Pattern) -> float:
-        return float(series.fillna("").str.contains(pattern, regex=True, na=False).mean() * 100)
-
-
-    pattern_summary = pd.DataFrame(
-        [
-            ("Title", "LaTeX-like markup", pattern_share(text_sample_df["title"], LATEX_RE)),
-            ("Title", "URL", pattern_share(text_sample_df["title"], URL_RE)),
-            ("Title", "Non-ASCII character", pattern_share(text_sample_df["title"], NON_ASCII_RE)),
-            ("Abstract", "HTML-like tag", pattern_share(text_sample_df["abstract"], HTML_RE)),
-            ("Abstract", "LaTeX-like markup", pattern_share(text_sample_df["abstract"], LATEX_RE)),
-            ("Abstract", "URL", pattern_share(text_sample_df["abstract"], URL_RE)),
-            ("Abstract", "Email address", pattern_share(text_sample_df["abstract"], EMAIL_RE)),
-            ("Abstract", "Excess punctuation", pattern_share(text_sample_df["abstract"], EXCESS_PUNCT_RE)),
-            ("Abstract", "Withdrawn / retracted wording", pattern_share(text_sample_df["abstract"], WITHDRAWN_RE)),
-        ],
-        columns=["Field", "Pattern", "Share of sample (%)"],
+    top_domains_for_length = primary_domain_counts.head(8)[["primary_domain"]].merge(
+        domain_abstract_length_summary,
+        on="primary_domain",
+        how="left",
     )
+    top_domains_for_length = top_domains_for_length.sort_values("median_abstract_words", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.errorbar(
+        top_domains_for_length["median_abstract_words"],
+        top_domains_for_length["primary_domain"],
+        xerr=[
+            top_domains_for_length["median_abstract_words"] - top_domains_for_length["p25_abstract_words"],
+            top_domains_for_length["p75_abstract_words"] - top_domains_for_length["median_abstract_words"],
+        ],
+        fmt="o",
+        color="#0f766e",
+        ecolor="#94a3b8",
+        capsize=4,
+    )
+    ax.set_title("Abstract Word-Length Spread by Major Primary Domain")
+    ax.set_xlabel("Median abstract length with interquartile range")
+    ax.set_ylabel("")
+    plt.tight_layout()
+    plt.show()
+    """
+)
+
+code(
+    """
+    fig, ax = plt.subplots(figsize=(11, 5))
+    artifact_plot = text_artifact_patterns.sort_values("share_pct", ascending=True)
+    sns.barplot(
+        data=artifact_plot,
+        x="share_pct",
+        y=artifact_plot["field"] + " | " + artifact_plot["pattern"],
+        hue=artifact_plot["field"],
+        dodge=False,
+        palette="flare",
+        legend=False,
+        ax=ax,
+    )
+    ax.set_title("Text Artifact Prevalence on the Full Dataset")
+    ax.set_xlabel("Share of papers (%)")
+    ax.set_ylabel("")
+    plt.tight_layout()
+    plt.show()
+
+    display(text_artifact_patterns.sort_values(["field", "share_pct"], ascending=[True, False]))
+    """
+)
+
+code(
+    """
+    def example_table(rows):
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+        preferred = [col for col in ["id", "primary_category", "title", "abstract_word_len", "issue_tags", "abstract_preview"] if col in frame.columns]
+        return frame[preferred]
 
 
-    def make_example_table(frame: pd.DataFrame, rows: int = 3) -> pd.DataFrame:
-        subset = frame.head(rows).copy()
-        subset["abstract_preview"] = subset["abstract"].map(lambda x: clip_text(x, 220))
-        return subset[["id", "title", "abstract_word_len", "abstract_preview"]]
-
-
-    normal_examples = text_sample_df[
-        (text_sample_df["abstract_word_len"].between(110, 180))
-        & (~text_sample_df["abstract"].str.contains(LATEX_RE, regex=True, na=False))
-        & (~text_sample_df["abstract"].str.contains(URL_RE, regex=True, na=False))
-        & (~text_sample_df["abstract"].str.contains(WITHDRAWN_RE, regex=True, na=False))
-    ].head(3)
-
-    problematic_examples = text_sample_df[
-        text_sample_df["abstract"].str.contains(LATEX_RE, regex=True, na=False)
-        | text_sample_df["abstract"].str.contains(URL_RE, regex=True, na=False)
-        | text_sample_df["abstract"].str.contains(WITHDRAWN_RE, regex=True, na=False)
-        | text_sample_df["abstract"].str.contains(HTML_RE, regex=True, na=False)
-    ].head(3)
-
-    short_examples = text_sample_df.nsmallest(3, "abstract_word_len")
-    long_examples = text_sample_df.nlargest(3, "abstract_word_len")
-
-    display(pattern_summary)
-    display(make_example_table(normal_examples))
-    display(make_example_table(problematic_examples))
-    display(make_example_table(short_examples))
-    display(make_example_table(long_examples))
+    display(example_table(example_rows["normal_examples"]))
+    display(example_table(example_rows["problematic_examples"]))
+    display(example_table(example_rows["short_abstract_examples"]))
+    display(example_table(example_rows["long_abstract_examples"]))
     """
 )
 
@@ -1080,9 +1473,9 @@ code(
     display(
         Markdown(
             f'''
-    **Interpretation.** Abstract lengths are reasonably well behaved for embedding models: the median abstract is **{summary['length_percentiles']['abstract_word_len']['50']:.0f} words**, and even the 95th percentile is only **{summary['length_percentiles']['abstract_word_len']['95']:.0f} words**. That is short enough for standard transformer input windows when title and abstract are concatenated.
+    **Interpretation.** The corpus is well aligned with modern scientific encoders from a sequence-length perspective. The median abstract length is **{summary['length_percentiles']['abstract_word_len']['50']:.0f} words**, the 95th percentile is **{summary['length_percentiles']['abstract_word_len']['95']:.0f} words**, and even the upper tail remains manageable for title-plus-abstract inputs.
 
-    The more meaningful text-quality issue is **scientific markup**, not raw length. In the reservoir sample, LaTeX-like patterns appear in a substantial fraction of abstracts, and URLs or withdrawn notices are present but much rarer. This argues for **light artifact handling** rather than aggressive normalization: scientific symbols carry signal, but withdrawn placeholders and duplicated notices should not remain in the modeling corpus unchanged.
+    The larger preprocessing issue is not raw length but **artifact-bearing scientific text**. LaTeX-style notation, newline artifacts, and a smaller number of withdrawn or noisy abstracts are visibly present. That supports a **light-touch preprocessing strategy**: preserve scientific wording and notation when using transformer encoders, but explicitly handle withdrawn placeholders, duplicated content, and obvious URL or email noise.
     '''
         )
     )
@@ -1093,110 +1486,70 @@ md("## 8. Preprocessing-Oriented Analysis")
 
 md(
     """
-    The purpose of preprocessing EDA is not to blindly clean the corpus as much as possible. Instead, it is to quantify what different normalization choices do to the vocabulary and token distribution so later modeling choices are evidence-based.
-
-    For transformer-style scientific embeddings such as SciBERT or SPECTER, aggressive stopword removal, stemming, and formula stripping can remove useful scientific cues. For traditional bag-of-words baselines, however, lowercasing and punctuation cleanup are still reasonable. The comparisons below are therefore intentionally lightweight.
+    This section is deliberately tied to downstream modeling. The goal is not maximal cleaning; it is to understand what different preprocessing choices do to the corpus and which choices remain defensible for transformer embeddings versus token-based baselines.
     """
 )
 
 code(
     """
-    stopwords = set(ENGLISH_STOP_WORDS)
-    analysis_texts = (text_sample_df["title"].fillna("") + " " + text_sample_df["abstract"].fillna("")).tolist()[:TEXT_ANALYSIS_SAMPLE]
+    display(token_metrics)
+    """
+)
 
+code(
+    """
+    vocab_plot = token_metrics[["configuration", "vocab_size", "vocab_reduction_vs_raw_pct"]].copy()
 
-    def tokenize_raw_lower(text: str) -> list[str]:
-        return [token.lower() for token in TOKEN_RE.findall(text)]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    sns.barplot(data=vocab_plot, x="vocab_size", y="configuration", hue="configuration", palette="mako", legend=False, ax=axes[0])
+    axes[0].set_title("Vocabulary Size by Preprocessing Configuration")
+    axes[0].set_xlabel("Unique tokens")
+    axes[0].set_ylabel("")
 
+    sns.barplot(data=token_metrics, x="top100_token_share_pct", y="configuration", hue="configuration", palette="rocket", legend=False, ax=axes[1])
+    axes[1].set_title("Concentration in Top 100 Tokens")
+    axes[1].set_xlabel("Share of all token occurrences (%)")
+    axes[1].set_ylabel("")
 
-    def tokenize_no_punct(text: str) -> list[str]:
-        lowered = NON_ALNUM_SPACE_RE.sub(" ", text.lower())
-        return [token for token in WS_RE.split(lowered) if token]
+    plt.tight_layout()
+    plt.show()
+    """
+)
 
-
-    def tokenize_no_punct_stop(text: str) -> list[str]:
-        return [token for token in tokenize_no_punct(text) if token not in stopwords]
-
-
-    def token_profile(texts: list[str], tokenizer) -> tuple[Counter, dict]:
-        counter = Counter()
-        total_tokens = 0
-        stop_tokens = 0
-        numeric_tokens = 0
-        punct_tokens = 0
-
-        for text in texts:
-            tokens = tokenizer(text)
-            counter.update(tokens)
-            total_tokens += len(tokens)
-            stop_tokens += sum(token in stopwords for token in tokens)
-            numeric_tokens += sum(any(ch.isdigit() for ch in token) for token in tokens)
-            punct_tokens += sum(bool(re.search(r"[^\\w\\s]", token)) for token in tokens)
-
-        vocab_size = len(counter)
-        hapax = sum(1 for value in counter.values() if value == 1)
-        top100_share = sum(value for _, value in counter.most_common(100)) / total_tokens * 100 if total_tokens else 0.0
-
-        metrics = {
-            "vocab_size": vocab_size,
-            "total_tokens": total_tokens,
-            "hapax_vocab_pct": hapax / vocab_size * 100 if vocab_size else 0.0,
-            "stopword_token_pct": stop_tokens / total_tokens * 100 if total_tokens else 0.0,
-            "numeric_token_pct": numeric_tokens / total_tokens * 100 if total_tokens else 0.0,
-            "punct_token_pct": punct_tokens / total_tokens * 100 if total_tokens else 0.0,
-            "top100_token_share_pct": top100_share,
-        }
-        return counter, metrics
-
-
-    tokenizers = {
-        "Raw lowercase tokenization": tokenize_raw_lower,
-        "Lowercase + punctuation removal": tokenize_no_punct,
-        "Lowercase + punctuation removal + stopword removal": tokenize_no_punct_stop,
-    }
-
-    token_counters = {}
-    token_metrics_rows = []
-    for config_name, tokenizer in tokenizers.items():
-        counter, metrics = token_profile(analysis_texts, tokenizer)
-        token_counters[config_name] = counter
-        token_metrics_rows.append({"Configuration": config_name, **metrics})
-
-    token_metrics_df = pd.DataFrame(token_metrics_rows)
-    token_metrics_df["vocab_reduction_vs_raw_pct"] = (
-        1 - token_metrics_df["vocab_size"] / token_metrics_df.loc[0, "vocab_size"]
-    ) * 100
-
-    display(token_metrics_df)
-
-    raw_top = pd.DataFrame(token_counters["Raw lowercase tokenization"].most_common(15), columns=["token", "count"])
-    clean_top = pd.DataFrame(
-        token_counters["Lowercase + punctuation removal + stopword removal"].most_common(15),
-        columns=["token", "count"],
-    )
+code(
+    """
+    raw_top = token_top_terms[token_top_terms["configuration"] == "Raw lowercase tokenization"].head(15)
+    clean_top = token_top_terms[
+        token_top_terms["configuration"] == "Lowercase + punctuation removal + stopword removal"
+    ].head(15)
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    sns.barplot(data=raw_top.sort_values("count"), x="count", y="token", hue="token", palette="mako", legend=False, ax=axes[0])
+    sns.barplot(data=raw_top.sort_values("count"), x="count", y="token", hue="token", palette="crest", legend=False, ax=axes[0])
     axes[0].set_title("Most Common Raw Tokens")
     axes[0].set_xlabel("Count")
     axes[0].set_ylabel("")
 
-    sns.barplot(data=clean_top.sort_values("count"), x="count", y="token", hue="token", palette="rocket", legend=False, ax=axes[1])
+    sns.barplot(data=clean_top.sort_values("count"), x="count", y="token", hue="token", palette="flare", legend=False, ax=axes[1])
     axes[1].set_title("Most Common Cleaned Tokens")
     axes[1].set_xlabel("Count")
     axes[1].set_ylabel("")
 
     plt.tight_layout()
     plt.show()
+    """
+)
 
-    cleaned_freq = np.array(sorted(token_counters["Lowercase + punctuation removal + stopword removal"].values(), reverse=True))
-    ranks = np.arange(1, min(len(cleaned_freq), 5000) + 1)
+code(
+    """
+    cleaned_rank_curve = token_top_terms[
+        token_top_terms["configuration"] == "Lowercase + punctuation removal + stopword removal"
+    ].head(1000)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(ranks, cleaned_freq[: len(ranks)], color="#7c3aed")
+    ax.plot(cleaned_rank_curve["rank"], cleaned_rank_curve["count"], color="#7c3aed", linewidth=2)
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_title("Token Frequency Rank Curve (Cleaned Tokens)")
+    ax.set_title("Token Frequency Rank Curve After Light Cleaning")
     ax.set_xlabel("Token rank (log scale)")
     ax.set_ylabel("Frequency (log scale)")
     plt.tight_layout()
@@ -1206,20 +1559,21 @@ code(
 
 code(
     """
-    raw_vocab = token_metrics_df.loc[token_metrics_df["Configuration"] == "Raw lowercase tokenization", "vocab_size"].iloc[0]
-    clean_vocab = token_metrics_df.loc[
-        token_metrics_df["Configuration"] == "Lowercase + punctuation removal + stopword removal",
+    raw_vocab = int(token_metrics.loc[token_metrics["configuration"] == "Raw lowercase tokenization", "vocab_size"].iloc[0])
+    clean_vocab = int(token_metrics.loc[
+        token_metrics["configuration"] == "Lowercase + punctuation removal + stopword removal",
         "vocab_size",
-    ].iloc[0]
+    ].iloc[0])
 
     display(
         Markdown(
             f'''
-    **Interpretation.** The vocabulary contracts sharply under light preprocessing: in the sampled corpus, moving from raw lowercase tokenization to punctuation removal plus stopword removal reduces the observed vocabulary from **{raw_vocab:,}** to **{clean_vocab:,}** unique tokens. At the same time, raw scientific text still contains meaningful structure such as symbols, short alphanumeric identifiers, and formula tokens.
+    **Interpretation.** On the **full dataset**, light preprocessing substantially contracts the vocabulary: moving from raw lowercase tokenization to punctuation removal plus stopword removal reduces the observed vocabulary from **{raw_vocab:,}** to **{clean_vocab:,}** unique tokens. At the same time, the token-frequency curve remains strongly long-tailed, which means rare-token management still matters for classical baselines.
 
-    **Implication for modeling.**
-    - For **transformer embeddings** (for example, SciBERT-like or SPECTER-like encoders), prefer **minimal normalization**: whitespace cleanup, optional URL/email stripping, and removal of obviously withdrawn placeholders. Avoid stemming, lemmatization, and blanket stopword removal.
-    - For **TF-IDF or bag-of-words baselines**, `lowercase + punctuation removal + stopword removal` is a sensible default, ideally paired with `min_df` filtering to suppress the long tail of ultra-rare tokens.
+    **Modeling implication.**
+    - For **transformer-based scientific embeddings** such as SciBERT- or SPECTER-style encoders, prefer minimal normalization: whitespace cleanup, optional URL/email stripping, and filtering of withdrawn or ultra-short placeholder abstracts.
+    - For **TF-IDF or bag-of-words baselines**, `lowercase + punctuation removal + stopword removal` is a sensible default, ideally with `min_df` filtering to control the rare-token tail.
+    - We intentionally do **not** recommend stemming or aggressive lemmatization as the default because scientific terminology is often meaning-bearing at the surface-form level.
     '''
         )
     )
@@ -1230,20 +1584,34 @@ md("## 9. Temporal and Metadata Analysis")
 
 md(
     """
-    Temporal skew affects both benchmarking and retrieval. A corpus dominated by recent submissions from fast-growing domains can bias cluster composition, nearest-neighbor retrieval, and any downstream qualitative interpretation of discovered topics.
+    Temporal skew matters because the corpus has grown rapidly and unevenly. If recent years are dominated by a few fast-growing domains, random sampling can distort qualitative conclusions about topic diversity and retrieval behavior.
     """
 )
 
 code(
     """
-    fig, ax = plt.subplots(figsize=(12, 5))
-    sns.lineplot(data=submission_year_counts, x="submission_year", y="count", marker="o", linewidth=2.5, ax=ax)
-    ax.set_title("Paper Count by Submission Year")
-    ax.set_xlabel("Submission year")
-    ax.set_ylabel("Paper count")
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    sns.lineplot(data=submission_year_counts, x="submission_year", y="count", marker="o", linewidth=2.2, ax=axes[0])
+    axes[0].set_title("Paper Count by Submission Year")
+    axes[0].set_xlabel("Submission year")
+    axes[0].set_ylabel("Paper count")
+
+    monthly_recent = submission_month_counts.copy()
+    monthly_recent["year"] = monthly_recent["submission_month"].str[:4].astype(int)
+    monthly_recent = monthly_recent[monthly_recent["year"] >= monthly_recent["year"].max() - 4]
+    sns.lineplot(data=monthly_recent, x="submission_month", y="count", linewidth=2, ax=axes[1], color="#b45309")
+    axes[1].set_title("Recent Monthly Submission Volume")
+    axes[1].set_xlabel("Submission month")
+    axes[1].set_ylabel("Paper count")
+    axes[1].tick_params(axis="x", rotation=60)
+
     plt.tight_layout()
     plt.show()
+    """
+)
 
+code(
+    """
     top_domains = primary_domain_counts.head(6)["primary_domain"].tolist()
     domain_year = primary_domain_year_counts[primary_domain_year_counts["primary_domain"].isin(top_domains)].copy()
     year_totals = primary_domain_year_counts.groupby("submission_year")["count"].sum().rename("year_total")
@@ -1278,18 +1646,31 @@ code(
         )
     )
 
+    version_plot = version_count_distribution.copy()
+    version_plot["version_bucket"] = version_plot["version_count"].where(version_plot["version_count"] <= 6, 7)
+    version_bucket = (
+        version_plot.groupby("version_bucket", as_index=False)["count"].sum().assign(
+            label=lambda df: df["version_bucket"].astype(str).replace({"7": "7+"})
+        )
+    )
+
     lag_plot = update_lag_distribution[update_lag_distribution["update_lag_years"] <= 10].copy()
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
     sns.barplot(data=author_bucket, x="label", y="count", hue="label", palette="crest", legend=False, ax=axes[0])
-    axes[0].set_title("Authors per Paper (13+ aggregated)")
+    axes[0].set_title("Authors per Paper")
     axes[0].set_xlabel("Authors")
     axes[0].set_ylabel("Paper count")
 
-    sns.barplot(data=lag_plot, x="update_lag_years", y="count", hue="update_lag_years", palette="flare", legend=False, ax=axes[1])
-    axes[1].set_title("Update Lag Distribution (0 to 10 years)")
-    axes[1].set_xlabel("Update lag in years")
+    sns.barplot(data=version_bucket, x="label", y="count", hue="label", palette="mako", legend=False, ax=axes[1])
+    axes[1].set_title("Version Count per Paper")
+    axes[1].set_xlabel("Versions")
     axes[1].set_ylabel("Paper count")
+
+    sns.barplot(data=lag_plot, x="update_lag_years", y="count", hue="update_lag_years", palette="flare", legend=False, ax=axes[2])
+    axes[2].set_title("Update Lag Distribution")
+    axes[2].set_xlabel("Lag in years")
+    axes[2].set_ylabel("Paper count")
 
     plt.tight_layout()
     plt.show()
@@ -1298,20 +1679,18 @@ code(
 
 code(
     """
-    cs_2010 = (
-        domain_year[(domain_year["primary_domain"] == "cs") & (domain_year["submission_year"] == 2010)]["share_pct"].iloc[0]
-    )
-    cs_2025 = (
-        domain_year[(domain_year["primary_domain"] == "cs") & (domain_year["submission_year"] == 2025)]["share_pct"].iloc[0]
-    )
-    recent_share = submission_year_counts.loc[submission_year_counts["submission_year"] >= 2018, "count"].sum() / submission_year_counts["count"].sum() * 100
+    cs_rows = domain_year[domain_year["primary_domain"] == "cs"]
+    cs_start_year = int(cs_rows["submission_year"].min())
+    cs_end_year = int(cs_rows["submission_year"].max())
+    cs_start_share = float(cs_rows.loc[cs_rows["submission_year"] == cs_start_year, "share_pct"].iloc[0])
+    cs_end_share = float(cs_rows.loc[cs_rows["submission_year"] == cs_end_year, "share_pct"].iloc[0])
 
     display(
         Markdown(
             f'''
-    **Interpretation.** The corpus is strongly **temporally skewed toward recent years**: about **{recent_share:.1f}%** of all papers were submitted in **2018 or later**. The domain mix has also shifted substantially. In the primary-domain view, **computer science grew from {cs_2010:.1f}% of yearly submissions in 2010 to {cs_2025:.1f}% in 2025**.
+    **Interpretation.** The corpus is strongly weighted toward recent activity: **{summary['recent_2018_share_pct']:.1f}%** of papers were submitted in **2018 or later**, and **{summary['recent_2020_share_pct']:.1f}%** arrived in **2020 or later**. Domain composition has also shifted. In the primary-domain view, **computer science moved from {cs_start_share:.1f}% of yearly submissions in {cs_start_year} to {cs_end_share:.1f}% in {cs_end_year}**.
 
-    This matters for evaluation and retrieval. A random sample from the full corpus will naturally be dominated by recent, CS-heavy material unless time is explicitly controlled. If the benchmark claims broad scientific coverage, this temporal shift should be stated clearly in the report.
+    This matters for benchmarking. A naive random sample from the full corpus will naturally emphasize recent and CS-heavy material. If we claim broad scientific topic discovery, the report needs to acknowledge that temporal and domain skew explicitly.
     '''
         )
     )
@@ -1322,111 +1701,20 @@ md("## 10. Data Splitting Strategy Analysis")
 
 md(
     """
-    The benchmark needs a split strategy that preserves label proportions without overcomplicating a multi-label setting. Since arXiv records can have several categories, we evaluate the practical compromise of stratifying on the primary category while retaining the full multi-label information for analysis.
+    The split strategy should preserve category structure without overengineering multi-label stratification. Because every split decision affects downstream comparison of embeddings and clustering algorithms, we evaluate random versus stratified splitting on the **full dataset**.
     """
 )
 
 code(
     """
-    def evaluate_thresholds(split_df: pd.DataFrame, thresholds=(2, 3, 5, 10, 20), random_state: int = RANDOM_SEED) -> pd.DataFrame:
-        rows = []
-        label_counts = split_df["primary_category"].value_counts()
-        for threshold in thresholds:
-            eligible = split_df[split_df["primary_category"].map(label_counts) >= threshold].copy()
-            works = True
-            try:
-                train_tmp, heldout_tmp = train_test_split(
-                    eligible,
-                    test_size=0.30,
-                    random_state=random_state,
-                    stratify=eligible["primary_category"],
-                )
-                train_test_split(
-                    heldout_tmp,
-                    test_size=2 / 3,
-                    random_state=random_state,
-                    stratify=heldout_tmp["primary_category"],
-                )
-            except Exception:
-                works = False
-
-            rows.append(
-                {
-                    "minimum_sample_count_per_class": threshold,
-                    "eligible_sample_rows": len(eligible),
-                    "eligible_sample_classes": eligible["primary_category"].nunique(),
-                    "stratified_70_10_20_works_on_sample": works,
-                }
-            )
-        return pd.DataFrame(rows)
-
-
-    def simulate_split_strategies(
-        split_df: pd.DataFrame,
-        minimum_count: int = SPLIT_SIMULATION_MIN_COUNT,
-        random_state: int = RANDOM_SEED,
-    ):
-        label_counts = split_df["primary_category"].value_counts()
-        eligible = split_df[split_df["primary_category"].map(label_counts) >= minimum_count].copy()
-
-        train_random, temp_random = train_test_split(eligible, test_size=0.30, random_state=random_state)
-        val_random, test_random = train_test_split(temp_random, test_size=2 / 3, random_state=random_state)
-
-        train_strat, temp_strat = train_test_split(
-            eligible,
-            test_size=0.30,
-            random_state=random_state,
-            stratify=eligible["primary_category"],
-        )
-        val_strat, test_strat = train_test_split(
-            temp_strat,
-            test_size=2 / 3,
-            random_state=random_state,
-            stratify=temp_strat["primary_category"],
-        )
-
-        global_dist = eligible["primary_category"].value_counts(normalize=True)
-
-        def summarize(name, frames):
-            rows = []
-            drift_tables = {}
-            for split_name, frame in frames.items():
-                dist = frame["primary_category"].value_counts(normalize=True)
-                aligned = global_dist.to_frame("global").join(dist.to_frame("split"), how="left").fillna(0)
-                aligned["abs_diff_pct_points"] = (aligned["split"] - aligned["global"]).abs() * 100
-                rows.append(
-                    {
-                        "strategy": name,
-                        "split": split_name,
-                        "size": len(frame),
-                        "mean_abs_diff_pct_points": aligned["abs_diff_pct_points"].mean(),
-                        "max_abs_diff_pct_points": aligned["abs_diff_pct_points"].max(),
-                        "missing_categories": int((aligned["split"] == 0).sum()),
-                    }
-                )
-                drift_tables[(name, split_name)] = aligned.sort_values("abs_diff_pct_points", ascending=False)
-            return rows, drift_tables
-
-        random_rows, random_tables = summarize(
-            "Random",
-            {"Train": train_random, "Validation": val_random, "Test": test_random},
-        )
-        strat_rows, strat_tables = summarize(
-            "Stratified",
-            {"Train": train_strat, "Validation": val_strat, "Test": test_strat},
-        )
-
-        summary_frame = pd.DataFrame(random_rows + strat_rows)
-        return eligible, summary_frame, {**random_tables, **strat_tables}
-
-
-    threshold_table = evaluate_thresholds(split_sample_df)
-    eligible_split_sample, split_strategy_summary, drift_tables = simulate_split_strategies(split_sample_df)
-
-    display(threshold_table)
+    display(split_threshold_summary)
     display(split_strategy_summary)
+    """
+)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+code(
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
     sns.barplot(
         data=split_strategy_summary,
         x="split",
@@ -1435,7 +1723,7 @@ code(
         palette="mako",
         ax=axes[0],
     )
-    axes[0].set_title("Average Category Share Drift by Split")
+    axes[0].set_title("Average Category-Share Drift by Split Strategy")
     axes[0].set_xlabel("")
     axes[0].set_ylabel("Mean absolute drift (percentage points)")
 
@@ -1447,35 +1735,54 @@ code(
         palette="rocket",
         ax=axes[1],
     )
-    axes[1].set_title("Worst-Case Category Share Drift by Split")
+    axes[1].set_title("Worst-Case Category-Share Drift by Split Strategy")
     axes[1].set_xlabel("")
     axes[1].set_ylabel("Maximum absolute drift (percentage points)")
 
     plt.tight_layout()
     plt.show()
-
-    worst_random_test = drift_tables[("Random", "Test")].head(10).reset_index().rename(columns={"index": "primary_category"})
-    worst_strat_test = drift_tables[("Stratified", "Test")].head(10).reset_index().rename(columns={"index": "primary_category"})
-
-    display(worst_random_test[["primary_category", "global", "split", "abs_diff_pct_points"]])
-    display(worst_strat_test[["primary_category", "global", "split", "abs_diff_pct_points"]])
     """
 )
 
 code(
     """
-    full_min_primary = int(primary_category_counts["count"].min())
+    worst_random_test = (
+        split_drift_tables[
+            (split_drift_tables["strategy"] == "Random") & (split_drift_tables["split"] == "Test")
+        ]
+        .sort_values("abs_diff_pct_points", ascending=False)
+        .head(10)
+        .reset_index(drop=True)
+    )
+    worst_stratified_test = (
+        split_drift_tables[
+            (split_drift_tables["strategy"] == "Stratified by primary category")
+            & (split_drift_tables["split"] == "Test")
+        ]
+        .sort_values("abs_diff_pct_points", ascending=False)
+        .head(10)
+        .reset_index(drop=True)
+    )
+
+    display(worst_random_test)
+    display(worst_stratified_test)
+    """
+)
+
+code(
+    """
+    min_primary_count = int(primary_category_counts["count"].min())
     rare_primary_le_50 = int((primary_category_counts["count"] <= 50).sum())
 
     display(
         Markdown(
             f'''
-    **Interpretation.** On the full dataset, the smallest primary category still has **{full_min_primary} papers**, so a **70/10/20 split stratified by primary category is feasible** across all 172 primary labels. In the sample-based simulation, stratification dramatically reduces distribution drift relative to naive random splitting.
+    **Interpretation.** On the full dataset, the smallest primary category still contains **{min_primary_count} papers**, so a **70/10/20 split stratified by primary category is feasible across all 172 primary labels**. The full-dataset comparison also shows that stratification materially reduces category-share drift relative to naive random splitting.
 
     **Recommendation.**
     - Use **70/10/20 stratified sampling on `primary_category`** as the default split strategy.
-    - Keep the **full multi-label category string** for analysis, but do not require exact multi-label stratification for the first benchmark iteration.
-    - Mention that **{rare_primary_le_50} primary categories have 50 papers or fewer**, so validation and test statistics for those rare classes will still be noisy even under stratification.
+    - Retain the full multi-label category string for analysis, but do not require exact multi-label stratification in the first benchmark version.
+    - Mention that **{rare_primary_le_50} primary categories have 50 papers or fewer**, so rare-category validation and test statistics remain noisy even under stratification.
     '''
         )
     )
@@ -1486,58 +1793,57 @@ md("## 11. Outliers, Edge Cases, and Risks")
 
 md(
     """
-    The goal of this section is to convert the EDA into modeling guidance. Each row below links an empirical observation to a concrete risk for clustering, embedding generation, evaluation, or retrieval design.
+    The point of this section is to convert EDA into actionable modeling guidance. Each risk below is tied directly to how it can affect clustering, embedding generation, evaluation, or retrieval behavior.
     """
 )
 
 code(
     """
-    recent_share = submission_year_counts.loc[submission_year_counts["submission_year"] >= 2018, "count"].sum() / submission_year_counts["count"].sum() * 100
     top50_share = primary_category_counts.head(50)["count"].sum() / primary_category_counts["count"].sum() * 100
 
     risk_register = pd.DataFrame(
         [
             (
                 "Long-tail label imbalance",
-                f"Top 50 primary categories account for {top50_share:.1f}% of papers; 4 primary categories have 50 papers or fewer.",
-                "K-means centroids will be pulled toward dominant categories; macro evaluation across rare categories will be unstable.",
-                "Report both aggregate and sensitivity analyses, and interpret rare-category metrics cautiously.",
+                f"Top 50 primary categories account for {top50_share:.1f}% of papers; {summary['rare_primary_categories_le_50']} primary categories have 50 papers or fewer.",
+                "Dominant topics can steer K-means centroids and make macro-level label evaluation unstable in the tail.",
+                "Report both aggregate results and caveats for rare categories; consider filtered sensitivity analyses.",
             ),
             (
                 "Multi-label ambiguity",
-                f"{summary['multi_label_share_pct']:.1f}% of papers carry multiple categories.",
-                "A single reference label can penalize clusters that capture cross-disciplinary structure.",
-                "Use primary labels for the main split/evaluation, but analyze multi-label cases separately in the report.",
+                f"{summary['multi_label_share_pct']:.1f}% of papers carry multiple category labels.",
+                "A single reference label can penalize clusters that capture interdisciplinary structure.",
+                "Use primary labels for the main benchmark, but inspect multi-label cases separately in analysis.",
             ),
             (
                 "Duplicate and near-duplicate content",
-                f"{summary['duplicate_paper_ids']} duplicate IDs, {summary['duplicate_summary']['normalized_title']['duplicate_records']:,} normalized-title duplicates, and {summary['duplicate_summary']['title_abstract_content']['duplicate_records']:,} duplicate title+abstract records.",
-                "Duplicates can inflate cluster purity and retrieval precision by injecting repeated content.",
-                "Deduplicate on paper ID and normalized title+abstract before final benchmarking.",
+                f"{summary['duplicate_paper_ids']} duplicate IDs and {summary['duplicate_summary']['title_abstract_content']['duplicate_records']:,} duplicate title+abstract records were detected.",
+                "Duplicates can inflate retrieval precision and cluster purity by repeating content.",
+                "Deduplicate on paper ID and normalized title+abstract before final modeling.",
             ),
             (
                 "Short or placeholder abstracts",
-                f"{int((abstract_word_len <= 10).sum()):,} abstracts have 10 words or fewer; sample inspection shows withdrawn placeholders.",
-                "These documents are poor inputs for semantic embeddings and can form degenerate clusters.",
-                "Filter withdrawn or ultra-short records, or route them to a separate error bucket.",
+                f"{int((abstract_word_len <= 10).sum()):,} abstracts contain 10 words or fewer.",
+                "These rows are weak inputs for semantic embeddings and can form trivial or noisy clusters.",
+                "Filter withdrawn or ultra-short records, or isolate them in a separate exclusion rule.",
             ),
             (
-                "Scientific markup and artifact text",
-                "Sample-based inspection shows frequent LaTeX and smaller amounts of URLs / HTML-like text.",
-                "Aggressive cleanup can remove scientific meaning, while no cleanup can hurt token baselines.",
-                "Use minimal cleanup for transformer encoders and stronger normalization only for TF-IDF-style baselines.",
+                "Scientific markup artifacts",
+                "LaTeX-like text, newline artifacts, and smaller amounts of URL/email noise are present across the corpus.",
+                "Aggressive cleanup may remove scientific meaning, while no cleanup can hurt token baselines.",
+                "Use minimal normalization for transformers and stronger normalization only for TF-IDF-style baselines.",
             ),
             (
                 "Temporal skew",
-                f"{recent_share:.1f}% of papers were submitted in 2018 or later, with strong recent growth in CS-related domains.",
-                "Recent, CS-heavy topics can dominate both clustering and nearest-neighbor retrieval if time is ignored.",
-                "Document the skew and consider time-aware analyses or at least temporal breakdowns in the report.",
+                f"{summary['recent_2018_share_pct']:.1f}% of papers were submitted in 2018 or later, with strong recent growth in computer-science-related domains.",
+                "Recent, CS-heavy content can dominate both clusters and nearest-neighbor retrieval.",
+                "Document the skew and include temporal framing in the report discussion.",
             ),
             (
                 "Computational scale",
                 f"The corpus contains {summary['record_count']:,} papers.",
-                "Agglomerative clustering on all pairwise distances is infeasible; full-corpus embeddings also require batching and indexing.",
-                "Prefer batched embedding generation, approximate nearest-neighbor retrieval, and scalable clustering variants such as MiniBatchKMeans or staged hierarchical approaches.",
+                "Naive agglomerative clustering and fully dense pairwise operations are impractical at this scale.",
+                "Use batched embedding generation, approximate retrieval indexes, and scalable clustering variants.",
             ),
         ],
         columns=["Risk", "Evidence", "Downstream impact", "Mitigation"],
@@ -1552,34 +1858,41 @@ md("## 12. Key Findings and Recommendations")
 code(
     """
     top_domain = primary_domain_counts.iloc[0]
+    raw_vocab = int(token_metrics.loc[token_metrics["configuration"] == "Raw lowercase tokenization", "vocab_size"].iloc[0])
+    clean_vocab = int(token_metrics.loc[
+        token_metrics["configuration"] == "Lowercase + punctuation removal + stopword removal",
+        "vocab_size",
+    ].iloc[0])
+
     final_note = f'''
     ### Key Findings
 
-    - The corpus is large and modeling-ready at the core-field level: **{summary['record_count']:,} papers**, **{summary['unique_primary_categories']} primary categories**, and complete coverage for `title`, `abstract`, `categories`, `versions`, and `update_date`.
-    - Category imbalance is real but not pathological at the head: the largest primary category covers **{summary['top_primary_category_share_pct']:.2f}%** of the corpus, while the primary-domain view is led by **{top_domain['primary_domain']} ({top_domain['share_pct']:.1f}%)**.
-    - Multi-label structure is common, not exceptional: **{summary['multi_label_share_pct']:.1f}%** of papers have multiple category assignments.
-    - Text lengths are manageable for modern encoders: the median abstract is **{summary['length_percentiles']['abstract_word_len']['50']:.0f} words**, and the 95th percentile is **{summary['length_percentiles']['abstract_word_len']['95']:.0f} words**.
-    - The main data-quality risks are **duplicates**, **withdrawn / placeholder abstracts**, and **scientific markup artifacts**, not missing core text.
-    - The dataset is temporally skewed toward recent years, with a visibly increasing computer-science share in the later part of the corpus.
+    - The corpus is large and analytically rich: **{summary['record_count']:,} papers**, **{summary['unique_primary_categories']} primary categories**, and complete coverage for the fields most important to topic discovery.
+    - Category imbalance is meaningful and clearly long-tailed. The largest primary category covers **{summary['top_primary_category_share_pct']:.2f}%** of the corpus, while the primary-domain view is led by **{top_domain['primary_domain']} ({top_domain['share_pct']:.1f}%)**.
+    - Multi-label structure is common rather than exceptional: **{summary['multi_label_share_pct']:.1f}%** of papers have multiple category assignments.
+    - Text lengths are well within the operating range of modern transformer encoders: the median abstract is **{summary['length_percentiles']['abstract_word_len']['50']:.0f} words** and the 95th percentile is **{summary['length_percentiles']['abstract_word_len']['95']:.0f} words**.
+    - The main data-quality risks are **duplicate content**, **withdrawn or placeholder abstracts**, and **scientific markup artifacts**, not missing core text fields.
+    - The dataset is temporally skewed toward recent years, and the later years are substantially more computer-science-heavy than earlier periods.
 
     ### Recommended Preprocessing
 
-    - For **transformer embeddings**: keep title and abstract largely intact, apply whitespace normalization, optionally strip obvious URL/email noise, and filter withdrawn or ultra-short placeholder abstracts. Do **not** default to stemming or stopword removal.
-    - For **TF-IDF or bag-of-words baselines**: use lowercasing, punctuation removal, stopword removal, and a sensible `min_df` threshold to control the rare-token tail.
-    - Deduplicate on **paper ID** and preferably on a **normalized title-plus-abstract hash** before benchmarking.
+    - For **transformer embeddings**, keep title and abstract largely intact. Apply whitespace normalization, strip obvious URL or email noise when needed, and filter withdrawn or ultra-short placeholder records.
+    - For **TF-IDF or bag-of-words baselines**, use lowercasing, punctuation removal, stopword removal, and a sensible `min_df` threshold. On the full dataset, this reduces vocabulary from **{raw_vocab:,}** to **{clean_vocab:,}** unique tokens.
+    - Deduplicate on **paper ID** and preferably on a **normalized title-plus-abstract signature** before benchmarking.
 
     ### Recommended Experimental Design
 
     - Use a **70/10/20 split stratified by primary category**.
-    - Use the **primary category** as the main external evaluation label, but keep full multi-label assignments for analysis and caveats.
-    - Report the full **172-category** benchmark, but consider an additional sensitivity analysis on a filtered subset or minimum-support threshold because the tail remains thin for a handful of categories.
-    - Treat scalability as a first-class benchmarking constraint: use batched embeddings, avoid naive full-corpus agglomerative clustering, and document runtime or memory tradeoffs alongside quality metrics.
+    - Use the **primary category** as the main external evaluation label, while retaining the full multi-label assignments for interpretation and failure analysis.
+    - Report the full **172-category** benchmark, but consider an additional sensitivity analysis on a filtered subset or minimum-support threshold to show how rare labels affect results.
+    - Treat scalability as part of the benchmark: record runtime or memory costs alongside clustering quality, and avoid naive algorithms that do not scale to millions of papers.
 
-    ### Report Caveats Worth Explicitly Mentioning
+    ### Caveats to Mention Explicitly in the Report
 
-    - arXiv categories are an imperfect proxy for latent topics, especially for multi-label and cross-disciplinary papers.
-    - Temporal and domain skew can bias both cluster composition and retrieval examples.
-    - Rare categories and duplicated content can distort evaluation if they are not handled explicitly.
+    - arXiv categories are a useful reference signal, but they are not a perfect representation of latent scientific topics.
+    - Multi-label and interdisciplinary papers make single-label evaluation inherently lossy.
+    - Temporal and domain skew can shape both quantitative results and qualitative retrieval examples.
+    - Rare labels and duplicate content can distort evaluation if not handled explicitly.
     '''
 
     display(Markdown(final_note))
@@ -1589,9 +1902,9 @@ code(
 nb["cells"] = cells
 nb["metadata"] = {
     "kernelspec": {
-        "display_name": "Python (.venv)",
+        "display_name": "Python 3",
         "language": "python",
-        "name": "project-eda",
+        "name": "python3",
     },
     "language_info": {
         "name": "python",

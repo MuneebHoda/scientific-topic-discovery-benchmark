@@ -1,4 +1,4 @@
-"""TF-IDF baseline embedding pipeline with cached reductions."""
+"""TF-IDF baseline embedding pipeline with cache-aware full-corpus support."""
 
 from __future__ import annotations
 
@@ -8,10 +8,11 @@ from typing import Dict
 
 import joblib
 import numpy as np
+import pandas as pd
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from src.benchmark_splits import load_subset_split_frames
+from src.benchmark_splits import iter_split_batches, split_row_count
 from src.config import ProfileConfig
 from src.io_utils import ensure_dir, load_json, save_numpy, write_json
 from src.preprocess import tfidf_clean
@@ -23,7 +24,7 @@ def _tfidf_output_dir(profile: ProfileConfig, subset_name: str) -> Path:
 
 
 def run_tfidf_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
-    """Fit TF-IDF + SVD + UMAP for a benchmark subset."""
+    """Fit TF-IDF + SVD + reduction for a benchmark subset or full corpus."""
 
     output_dir = _tfidf_output_dir(profile, subset_name)
     metadata_path = output_dir / "metadata.json"
@@ -37,10 +38,17 @@ def run_tfidf_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
         return metadata
 
     scipy_sparse = __import__("scipy.sparse", fromlist=["sparse"])
-    split_frames = load_subset_split_frames(profile, subset_name)
-    train_texts = split_frames["train"]["text_input"].map(tfidf_clean).tolist()
-    val_texts = split_frames["val"]["text_input"].map(tfidf_clean).tolist()
-    test_texts = split_frames["test"]["text_input"].map(tfidf_clean).tolist()
+
+    def iter_clean_texts(split_name: str):
+        for batch in iter_split_batches(profile, subset_name, split_name, columns=["text_input"]):
+            frame = batch.to_pandas()
+            for text in frame["text_input"].astype(str):
+                yield tfidf_clean(text)
+
+    train_label_frame = pd.read_parquet(
+        profile.splits_dir() / f"{subset_name}_train.parquet",
+        columns=["primary_category"],
+    )
 
     start = time.perf_counter()
     vectorizer = TfidfVectorizer(
@@ -50,12 +58,13 @@ def run_tfidf_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
         norm="l2",
         dtype=np.float32,
     )
-    train_matrix = vectorizer.fit_transform(train_texts)
-    val_matrix = vectorizer.transform(val_texts)
-    test_matrix = vectorizer.transform(test_texts)
-    scipy_sparse.save_npz(output_dir / "train_tfidf.npz", train_matrix)
-    scipy_sparse.save_npz(output_dir / "val_tfidf.npz", val_matrix)
-    scipy_sparse.save_npz(output_dir / "test_tfidf.npz", test_matrix)
+    train_matrix = vectorizer.fit_transform(iter_clean_texts("train"))
+    val_matrix = vectorizer.transform(iter_clean_texts("val"))
+    test_matrix = vectorizer.transform(iter_clean_texts("test"))
+    if profile.save_sparse_tfidf_matrices:
+        scipy_sparse.save_npz(output_dir / "train_tfidf.npz", train_matrix)
+        scipy_sparse.save_npz(output_dir / "val_tfidf.npz", val_matrix)
+        scipy_sparse.save_npz(output_dir / "test_tfidf.npz", test_matrix)
     joblib.dump(vectorizer, vectorizer_path)
 
     n_components = min(profile.svd_components, max(2, min(train_matrix.shape) - 1))
@@ -75,17 +84,22 @@ def run_tfidf_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
         train_embeddings=train_svd,
         val_embeddings=val_svd,
         test_embeddings=test_svd,
-        train_primary_categories=split_frames["train"]["primary_category"].tolist(),
+        train_primary_categories=train_label_frame["primary_category"].tolist(),
         cache_dir=reduced_dir,
         metric="cosine",
+        source_array_paths={
+            "train": output_dir / "train_svd.npy",
+            "val": output_dir / "val_svd.npy",
+            "test": output_dir / "test_svd.npy",
+        },
     )
 
     metadata = {
         "embedding": "tfidf",
         "subset_name": subset_name,
-        "n_train": int(train_matrix.shape[0]),
-        "n_val": int(val_matrix.shape[0]),
-        "n_test": int(test_matrix.shape[0]),
+        "n_train": int(split_row_count(profile, subset_name, "train")),
+        "n_val": int(split_row_count(profile, subset_name, "val")),
+        "n_test": int(split_row_count(profile, subset_name, "test")),
         "n_features": int(train_matrix.shape[1]),
         "svd_components": int(n_components),
         "best_umap_config": umap_result["best_config"],
@@ -94,4 +108,3 @@ def run_tfidf_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
     }
     write_json(metadata_path, metadata)
     return metadata
-

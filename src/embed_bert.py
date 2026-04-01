@@ -1,17 +1,18 @@
-"""Optional BERT embedding pipeline for small local subsets."""
+"""BERT embedding pipeline with CUDA-aware full-corpus support."""
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
+import pandas as pd
 from numpy.lib.format import open_memmap
 
-from src.benchmark_splits import load_subset_split_frames
+from src.benchmark_splits import iter_split_batches, split_row_count
 from src.config import ProfileConfig
-from src.io_utils import ensure_dir, load_json, write_json
+from src.io_utils import ensure_dir, load_json, load_numpy, write_json
 from src.preprocess import dense_clean
 from src.reduce_umap import run_umap_search
 
@@ -21,48 +22,68 @@ def _bert_output_dir(profile: ProfileConfig, subset_name: str) -> Path:
 
 
 def _detect_torch_device(torch_module) -> str:
+    if torch_module.cuda.is_available():
+        return "cuda"
     if hasattr(torch_module.backends, "mps") and torch_module.backends.mps.is_available():
         return "mps"
     return "cpu"
 
 
-def _encode_bert_cls(
+def _encode_split_to_npy(
+    profile: ProfileConfig,
+    subset_name: str,
+    split_name: str,
     tokenizer,
     model,
     torch,
-    texts: List[str],
     batch_size: int,
     max_length: int,
     output_path: Path,
     device: str,
 ) -> np.ndarray:
-    """Encode [CLS] embeddings into a persisted .npy array."""
+    """Encode one saved split directly into an on-disk numpy array."""
 
     if output_path.exists():
         return np.load(output_path, mmap_mode="r")
 
+    total_rows = split_row_count(profile, subset_name, split_name)
     hidden_size = int(model.config.hidden_size)
-    array = open_memmap(output_path, mode="w+", dtype="float32", shape=(len(texts), hidden_size))
-    for start in range(0, len(texts), batch_size):
-        stop = min(len(texts), start + batch_size)
-        encoded = tokenizer(
-            texts[start:stop],
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        )
-        encoded = {key: value.to(device) for key, value in encoded.items()}
-        with torch.no_grad():
-            outputs = model(**encoded)
-            cls_embeddings = outputs.last_hidden_state[:, 0, :].detach().cpu().float().numpy()
-        array[start:stop] = cls_embeddings.astype(np.float32)
+    array = open_memmap(output_path, mode="w+", dtype="float32", shape=(total_rows, hidden_size))
+
+    cursor = 0
+    use_autocast = device == "cuda"
+    autocast_context = torch.cuda.amp.autocast if use_autocast else None
+
+    for batch in iter_split_batches(profile, subset_name, split_name, columns=["text_input"]):
+        frame = batch.to_pandas()
+        texts = frame["text_input"].astype(str).map(dense_clean).tolist()
+        for start in range(0, len(texts), batch_size):
+            stop = min(len(texts), start + batch_size)
+            encoded = tokenizer(
+                texts[start:stop],
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with torch.inference_mode():
+                if use_autocast:
+                    with autocast_context():
+                        outputs = model(**encoded)
+                else:
+                    outputs = model(**encoded)
+                cls_embeddings = outputs.last_hidden_state[:, 0, :].detach().cpu().float().numpy()
+            next_cursor = cursor + len(cls_embeddings)
+            array[cursor:next_cursor] = cls_embeddings.astype(np.float32)
+            cursor = next_cursor
+
     del array
     return np.load(output_path, mmap_mode="r")
 
 
 def run_bert_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
-    """Encode a subset with bert-base-uncased using [CLS] representations."""
+    """Encode a subset or the full benchmark corpus with a BERT-family encoder."""
 
     torch = __import__("torch")
     transformers = __import__("transformers", fromlist=["AutoModel", "AutoTokenizer"])
@@ -75,11 +96,6 @@ def run_bert_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
         metadata["reused_cache"] = True
         return metadata
 
-    split_frames = load_subset_split_frames(profile, subset_name)
-    train_texts = split_frames["train"]["text_input"].map(dense_clean).tolist()
-    val_texts = split_frames["val"]["text_input"].map(dense_clean).tolist()
-    test_texts = split_frames["test"]["text_input"].map(dense_clean).tolist()
-
     device = _detect_torch_device(torch)
     start = time.perf_counter()
     tokenizer = transformers.AutoTokenizer.from_pretrained(profile.bert_model_name)
@@ -87,47 +103,63 @@ def run_bert_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
     model = model.to(device)
     model.eval()
 
-    train_embeddings = _encode_bert_cls(
+    train_embeddings = _encode_split_to_npy(
+        profile=profile,
+        subset_name=subset_name,
+        split_name="train",
         tokenizer=tokenizer,
         model=model,
         torch=torch,
-        texts=train_texts,
         batch_size=profile.bert_batch_size,
         max_length=profile.bert_max_length,
         output_path=output_dir / "train_raw.npy",
         device=device,
     )
-    val_embeddings = _encode_bert_cls(
+    val_embeddings = _encode_split_to_npy(
+        profile=profile,
+        subset_name=subset_name,
+        split_name="val",
         tokenizer=tokenizer,
         model=model,
         torch=torch,
-        texts=val_texts,
         batch_size=profile.bert_batch_size,
         max_length=profile.bert_max_length,
         output_path=output_dir / "val_raw.npy",
         device=device,
     )
-    test_embeddings = _encode_bert_cls(
+    test_embeddings = _encode_split_to_npy(
+        profile=profile,
+        subset_name=subset_name,
+        split_name="test",
         tokenizer=tokenizer,
         model=model,
         torch=torch,
-        texts=test_texts,
         batch_size=profile.bert_batch_size,
         max_length=profile.bert_max_length,
         output_path=output_dir / "test_raw.npy",
         device=device,
     )
 
+    train_labels = pd.read_parquet(
+        profile.splits_dir() / f"{subset_name}_train.parquet",
+        columns=["primary_category"],
+    )["primary_category"].tolist()
+
     umap_result = run_umap_search(
         profile=profile,
         embedding_name="bert",
         subset_name=subset_name,
-        train_embeddings=np.asarray(train_embeddings, dtype=np.float32),
-        val_embeddings=np.asarray(val_embeddings, dtype=np.float32),
-        test_embeddings=np.asarray(test_embeddings, dtype=np.float32),
-        train_primary_categories=split_frames["train"]["primary_category"].tolist(),
+        train_embeddings=train_embeddings,
+        val_embeddings=val_embeddings,
+        test_embeddings=test_embeddings,
+        train_primary_categories=train_labels,
         cache_dir=reduced_dir,
         metric="cosine",
+        source_array_paths={
+            "train": output_dir / "train_raw.npy",
+            "val": output_dir / "val_raw.npy",
+            "test": output_dir / "test_raw.npy",
+        },
     )
 
     metadata = {
@@ -135,13 +167,12 @@ def run_bert_pipeline(profile: ProfileConfig, subset_name: str) -> Dict:
         "subset_name": subset_name,
         "device": device,
         "model_name": profile.bert_model_name,
-        "n_train": int(len(train_texts)),
-        "n_val": int(len(val_texts)),
-        "n_test": int(len(test_texts)),
+        "n_train": int(split_row_count(profile, subset_name, "train")),
+        "n_val": int(split_row_count(profile, subset_name, "val")),
+        "n_test": int(split_row_count(profile, subset_name, "test")),
         "best_umap_config": umap_result["best_config"],
         "runtime_seconds": time.perf_counter() - start,
         "reused_cache": False,
     }
     write_json(metadata_path, metadata)
     return metadata
-

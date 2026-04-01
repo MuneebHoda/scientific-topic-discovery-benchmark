@@ -1,4 +1,4 @@
-"""Deterministic benchmark subset creation for local-first experiments."""
+"""Deterministic benchmark subset creation for local and full-corpus runs."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 import pandas as pd
 
-from src.config import ProfileConfig
+from src.config import ProfileConfig, SubsetConfig
 from src.io_utils import ensure_dir, load_json, read_id_csv, stable_int, write_id_csv, write_json
 
 
@@ -54,19 +54,19 @@ class StratifiedReservoirSampler:
         return frame
 
 
-def _iter_clean_batches(clean_path: Path, batch_size: int = 100_000):
-    """Yield parquet batches from the cleaned modeling dataset."""
+def _iter_parquet_batches(path: Path, batch_size: int = 100_000, columns=None):
+    """Yield parquet batches from the supplied path."""
 
     pq = __import__("pyarrow.parquet", fromlist=["parquet"])
-    parquet_file = pq.ParquetFile(clean_path)
-    yield from parquet_file.iter_batches(batch_size=batch_size)
+    parquet_file = pq.ParquetFile(path)
+    yield from parquet_file.iter_batches(batch_size=batch_size, columns=columns)
 
 
 def _count_categories(clean_path: Path) -> Counter:
     """Count primary categories in the cleaned parquet dataset."""
 
     counts = Counter()
-    for batch in _iter_clean_batches(clean_path):
+    for batch in _iter_parquet_batches(clean_path, columns=["primary_category"]):
         frame = batch.to_pandas()
         counts.update(frame["primary_category"].astype(str))
     return counts
@@ -180,15 +180,121 @@ def _split_csv_path(profile: ProfileConfig, subset_name: str, split_name: str) -
     return profile.splits_dir() / f"{subset_name}_{split_name}_ids.csv"
 
 
+def split_parquet_path(profile: ProfileConfig, subset_name: str, split_name: str) -> Path:
+    return profile.splits_dir() / f"{subset_name}_{split_name}.parquet"
+
+
+def split_row_count(profile: ProfileConfig, subset_name: str, split_name: str) -> int:
+    """Return the number of rows in a saved split parquet."""
+
+    pq = __import__("pyarrow.parquet", fromlist=["parquet"])
+    return int(pq.ParquetFile(split_parquet_path(profile, subset_name, split_name)).metadata.num_rows)
+
+
 def subset_exists(profile: ProfileConfig, subset_name: str) -> bool:
     """Check whether a subset and its split files already exist."""
 
     return (
-        _subset_path(profile, subset_name).exists()
+        split_parquet_path(profile, subset_name, "train").exists()
+        and split_parquet_path(profile, subset_name, "val").exists()
+        and split_parquet_path(profile, subset_name, "test").exists()
         and _split_csv_path(profile, subset_name, "train").exists()
         and _split_csv_path(profile, subset_name, "val").exists()
         and _split_csv_path(profile, subset_name, "test").exists()
     )
+
+
+def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
+    ensure_dir(path.parent)
+    frame.to_parquet(path, index=False)
+
+
+def _write_split_parquets_from_frame(
+    profile: ProfileConfig,
+    subset_name: str,
+    subset_frame: pd.DataFrame,
+    split_ids: Dict[str, Sequence[str]],
+) -> None:
+    """Write split parquet files from an in-memory subset frame."""
+
+    id_sets = {split_name: set(ids) for split_name, ids in split_ids.items()}
+    for split_name, ids in split_ids.items():
+        frame = subset_frame[subset_frame["id"].astype(str).isin(id_sets[split_name])].copy()
+        frame = frame.reset_index(drop=True)
+        _write_parquet(split_parquet_path(profile, subset_name, split_name), frame)
+
+
+def _write_split_parquets_from_clean_dataset(
+    profile: ProfileConfig,
+    subset_name: str,
+    split_ids: Dict[str, Sequence[str]],
+    batch_size: int = 100_000,
+) -> None:
+    """Write split parquet files for a full-corpus subset by streaming the clean dataset."""
+
+    pyarrow = __import__("pyarrow")
+    pq = __import__("pyarrow.parquet", fromlist=["parquet"])
+
+    id_to_split = {}
+    for split_name, ids in split_ids.items():
+        for paper_id in ids:
+            id_to_split[str(paper_id)] = split_name
+
+    writers = {}
+    try:
+        for batch in _iter_parquet_batches(profile.clean_dataset_path(), batch_size=batch_size):
+            frame = batch.to_pandas()
+            frame["split_name"] = frame["id"].astype(str).map(id_to_split)
+            frame = frame[frame["split_name"].notna()].copy()
+            if frame.empty:
+                continue
+
+            for split_name in ("train", "val", "test"):
+                split_frame = frame[frame["split_name"] == split_name].drop(columns=["split_name"])
+                if split_frame.empty:
+                    continue
+                split_path = split_parquet_path(profile, subset_name, split_name)
+                table = pyarrow.Table.from_pandas(split_frame, preserve_index=False)
+                writer = writers.get(split_name)
+                if writer is None:
+                    ensure_dir(split_path.parent)
+                    writer = pq.ParquetWriter(split_path, table.schema, compression="zstd")
+                    writers[split_name] = writer
+                writer.write_table(table)
+    finally:
+        for writer in writers.values():
+            writer.close()
+
+
+def _create_full_dataset_subset(
+    profile: ProfileConfig,
+    spec: SubsetConfig,
+    batch_size: int,
+) -> Dict:
+    """Create split files for a subset that intentionally covers the whole cleaned dataset."""
+
+    id_frame = pd.read_parquet(profile.clean_dataset_path(), columns=["id", "primary_category"])
+    splits = deterministic_stratified_split(
+        id_frame,
+        seed=profile.seed + stable_int(spec.name),
+        train_fraction=profile.train_fraction,
+        val_fraction=profile.val_fraction,
+        test_fraction=profile.test_fraction,
+    )
+    for split_name, ids in splits.items():
+        write_id_csv(_split_csv_path(profile, spec.name, split_name), ids)
+    _write_split_parquets_from_clean_dataset(profile, spec.name, splits, batch_size=batch_size)
+
+    return {
+        "target_size": None,
+        "actual_size": int(len(id_frame)),
+        "category_count": int(id_frame["primary_category"].nunique()),
+        "train_size": int(len(splits["train"])),
+        "val_size": int(len(splits["val"])),
+        "test_size": int(len(splits["test"])),
+        "source": "clean_dataset",
+        "use_full_dataset": True,
+    }
 
 
 def create_benchmark_subsets(
@@ -196,7 +302,7 @@ def create_benchmark_subsets(
     force: bool = False,
     batch_size: int = 100_000,
 ) -> Dict:
-    """Create deterministic stratified subsets and split files."""
+    """Create deterministic stratified subsets and split parquet files."""
 
     ensure_dir(profile.splits_dir())
     summary_path = profile.split_summary_path()
@@ -210,25 +316,6 @@ def create_benchmark_subsets(
 
     category_counts = _count_categories(profile.clean_dataset_path())
     specs = profile.subset_configs()
-    samplers = {}
-    for subset_name, spec in specs.items():
-        quotas = allocate_category_quotas(
-            category_counts=category_counts,
-            target_size=spec.size,
-            min_category_count=spec.min_category_count,
-            min_subset_per_category=spec.min_subset_per_category,
-        )
-        samplers[subset_name] = StratifiedReservoirSampler(
-            subset_name=subset_name,
-            quotas=quotas,
-            seed=profile.seed + stable_int(subset_name),
-        )
-
-    for batch in _iter_clean_batches(profile.clean_dataset_path(), batch_size=batch_size):
-        frame = batch.to_pandas()
-        for row in frame.to_dict(orient="records"):
-            for sampler in samplers.values():
-                sampler.process(row)
 
     split_summary = {
         "cleaned_row_count": int(sum(category_counts.values())),
@@ -236,10 +323,43 @@ def create_benchmark_subsets(
         "subset_summaries": {},
     }
 
-    for subset_name, sampler in samplers.items():
-        subset_frame = sampler.to_frame()
+    sampled_specs = {}
+    for subset_name, spec in specs.items():
+        if spec.use_full_dataset:
+            split_summary["subset_summaries"][subset_name] = _create_full_dataset_subset(profile, spec, batch_size=batch_size)
+            continue
+
+        quotas = allocate_category_quotas(
+            category_counts=category_counts,
+            target_size=int(spec.size or 0),
+            min_category_count=spec.min_category_count,
+            min_subset_per_category=spec.min_subset_per_category,
+        )
+        sampled_specs[subset_name] = {
+            "spec": spec,
+            "sampler": StratifiedReservoirSampler(
+                subset_name=subset_name,
+                quotas=quotas,
+                seed=profile.seed + stable_int(subset_name),
+            ),
+        }
+
+    if sampled_specs:
+        for batch in _iter_parquet_batches(profile.clean_dataset_path(), batch_size=batch_size):
+            frame = batch.to_pandas()
+            for row in frame.to_dict(orient="records"):
+                for payload in sampled_specs.values():
+                    payload["sampler"].process(row)
+
+    for subset_name, payload in sampled_specs.items():
+        spec = payload["spec"]
+        subset_frame = payload["sampler"].to_frame()
+        if subset_frame.empty:
+            raise ValueError(
+                f"Subset '{subset_name}' is empty. Reduce `min_category_count` or use a larger cleaned dataset."
+            )
         subset_path = _subset_path(profile, subset_name)
-        subset_frame.to_parquet(subset_path, index=False)
+        _write_parquet(subset_path, subset_frame)
 
         splits = deterministic_stratified_split(
             subset_frame,
@@ -250,14 +370,17 @@ def create_benchmark_subsets(
         )
         for split_name, ids in splits.items():
             write_id_csv(_split_csv_path(profile, subset_name, split_name), ids)
+        _write_split_parquets_from_frame(profile, subset_name, subset_frame, splits)
 
         split_summary["subset_summaries"][subset_name] = {
-            "target_size": specs[subset_name].size,
+            "target_size": spec.size,
             "actual_size": int(len(subset_frame)),
             "category_count": int(subset_frame["primary_category"].nunique()),
             "train_size": int(len(splits["train"])),
             "val_size": int(len(splits["val"])),
             "test_size": int(len(splits["test"])),
+            "source": "sampled_subset",
+            "use_full_dataset": False,
         }
 
     write_json(summary_path, split_summary)
@@ -265,17 +388,33 @@ def create_benchmark_subsets(
 
 
 def load_subset(profile: ProfileConfig, subset_name: str) -> pd.DataFrame:
-    """Load a saved subset parquet."""
+    """Load a saved subset parquet or reconstruct it from split parquets."""
 
-    return pd.read_parquet(_subset_path(profile, subset_name))
+    subset_path = _subset_path(profile, subset_name)
+    if subset_path.exists():
+        return pd.read_parquet(subset_path)
+
+    frames = [load_split_frame(profile, subset_name, split_name) for split_name in ("train", "val", "test")]
+    frame = pd.concat(frames, ignore_index=True)
+    return frame
+
+
+def load_split_frame(profile: ProfileConfig, subset_name: str, split_name: str, columns=None) -> pd.DataFrame:
+    """Load a single split parquet."""
+
+    return pd.read_parquet(split_parquet_path(profile, subset_name, split_name), columns=columns)
+
+
+def iter_split_batches(profile: ProfileConfig, subset_name: str, split_name: str, batch_size: int = 50_000, columns=None):
+    """Yield parquet batches for a saved split."""
+
+    yield from _iter_parquet_batches(split_parquet_path(profile, subset_name, split_name), batch_size=batch_size, columns=columns)
 
 
 def load_subset_split_frames(profile: ProfileConfig, subset_name: str) -> Dict[str, pd.DataFrame]:
-    """Load a subset and partition it into split dataframes."""
+    """Load split parquet files directly into dataframes."""
 
-    frame = load_subset(profile, subset_name)
-    split_frames = {}
-    for split_name in ("train", "val", "test"):
-        ids = set(read_id_csv(_split_csv_path(profile, subset_name, split_name)))
-        split_frames[split_name] = frame[frame["id"].astype(str).isin(ids)].copy().reset_index(drop=True)
-    return split_frames
+    return {
+        split_name: load_split_frame(profile, subset_name, split_name).reset_index(drop=True)
+        for split_name in ("train", "val", "test")
+    }

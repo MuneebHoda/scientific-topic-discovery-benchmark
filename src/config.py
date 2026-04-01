@@ -1,16 +1,33 @@
-"""Configuration for the local-first benchmark pipeline."""
+"""Configuration for the benchmark pipeline across local and Colab profiles."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 RANDOM_SEED = 42
 ROOT_DIR = Path(__file__).resolve().parent.parent
-RAW_DATA_PATH = ROOT_DIR / "arxiv-metadata-oai-snapshot.json"
-EDA_DIR = ROOT_DIR / "artifacts" / "eda"
+
+
+def _resolve_raw_data_path() -> Path:
+    env_path = os.environ.get("ARXIV_DATA_PATH")
+    candidates = [
+        Path(env_path) if env_path else None,
+        ROOT_DIR / "arxiv-metadata-oai-snapshot.json",
+        Path("/content/arxiv-metadata-oai-snapshot.json"),
+        Path("/content/drive/MyDrive/arxiv-metadata-oai-snapshot.json"),
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return candidate
+    return ROOT_DIR / "arxiv-metadata-oai-snapshot.json"
+
+
+RAW_DATA_PATH = _resolve_raw_data_path()
+EDA_DIR = ROOT_DIR / "artifacts" / "eda_full"
 MODELING_DIR = ROOT_DIR / "artifacts" / "modeling"
 
 
@@ -19,9 +36,10 @@ class SubsetConfig:
     """Definition of a benchmark subset."""
 
     name: str
-    size: int
+    size: Optional[int]
     min_category_count: int = 25
     min_subset_per_category: int = 5
+    use_full_dataset: bool = False
 
 
 @dataclass(frozen=True)
@@ -38,14 +56,28 @@ class ProfileConfig:
     main_bert_subset_size: int = 5_000
     hdbscan_subset_size: int = 8_000
     agglomerative_subset_size: int = 2_500
+    tfidf_main_subset_name: str = "tfidf_main"
+    mpnet_main_subset_name: str = "mpnet_main"
+    bert_main_subset_name: str = "bert_main"
+    hdbscan_subset_name: str = "hdbscan_shared"
+    agglomerative_subset_name: str = "agglomerative_small"
+    tfidf_main_use_full_dataset: bool = False
+    bert_main_use_full_dataset: bool = False
     silhouette_eval_sample_size: int = 5_000
+    npmi_sample_size: int = 25_000
     tfidf_max_features: int = 50_000
     tfidf_min_df: int = 5
+    save_sparse_tfidf_matrices: bool = True
     svd_components: int = 100
     umap_components: int = 20
     umap_neighbors: Tuple[int, ...] = (15, 30)
     umap_min_dists: Tuple[float, ...] = (0.0, 0.1)
+    skip_umap_above_rows: int = 200_000
     kmeans_k_values: Tuple[int, ...] = (50, 100, 172)
+    kmeans_mode: str = "auto"
+    kmeans_minibatch_threshold: int = 100_000
+    kmeans_batch_size: int = 4_096
+    kmeans_max_iter: int = 100
     hdbscan_min_cluster_sizes: Tuple[int, ...] = (30, 50, 100)
     agglomerative_k_values: Tuple[int, ...] = (50, 100, 172)
     mpnet_model_name: str = "sentence-transformers/all-mpnet-base-v2"
@@ -65,16 +97,55 @@ class ProfileConfig:
     def subset_configs(self) -> Dict[str, SubsetConfig]:
         """Return the configured benchmark subsets."""
 
-        return {
-            "tfidf_main": SubsetConfig("tfidf_main", self.main_tf_idf_subset_size),
-            "mpnet_main": SubsetConfig("mpnet_main", self.main_mpnet_subset_size),
-            "bert_main": SubsetConfig("bert_main", self.main_bert_subset_size),
-            "hdbscan_shared": SubsetConfig("hdbscan_shared", self.hdbscan_subset_size),
-            "agglomerative_small": SubsetConfig(
-                "agglomerative_small",
-                self.agglomerative_subset_size,
+        requested = [
+            SubsetConfig(
+                name=self.tfidf_main_subset_name,
+                size=None if self.tfidf_main_use_full_dataset else self.main_tf_idf_subset_size,
+                min_category_count=1 if self.tfidf_main_use_full_dataset else 25,
+                min_subset_per_category=1 if self.tfidf_main_use_full_dataset else 5,
+                use_full_dataset=self.tfidf_main_use_full_dataset,
             ),
-        }
+        ]
+        if self.run_mpnet:
+            requested.append(
+                SubsetConfig(
+                    name=self.mpnet_main_subset_name,
+                    size=self.main_mpnet_subset_size,
+                    min_category_count=25,
+                    min_subset_per_category=5,
+                    use_full_dataset=False,
+                )
+            )
+        if self.run_bert:
+            requested.append(
+                SubsetConfig(
+                    name=self.bert_main_subset_name,
+                    size=None if self.bert_main_use_full_dataset else self.main_bert_subset_size,
+                    min_category_count=1 if self.bert_main_use_full_dataset else 25,
+                    min_subset_per_category=1 if self.bert_main_use_full_dataset else 5,
+                    use_full_dataset=self.bert_main_use_full_dataset,
+                )
+            )
+        if self.run_hdbscan:
+            requested.append(SubsetConfig(name=self.hdbscan_subset_name, size=self.hdbscan_subset_size))
+        if self.run_agglomerative:
+            requested.append(SubsetConfig(name=self.agglomerative_subset_name, size=self.agglomerative_subset_size))
+
+        unique: Dict[str, SubsetConfig] = {}
+        for spec in requested:
+            existing = unique.get(spec.name)
+            if existing is None:
+                unique[spec.name] = spec
+                continue
+
+            if (
+                existing.size != spec.size
+                or existing.min_category_count != spec.min_category_count
+                or existing.min_subset_per_category != spec.min_subset_per_category
+                or existing.use_full_dataset != spec.use_full_dataset
+            ):
+                raise ValueError(f"Conflicting subset definitions for shared subset name '{spec.name}'.")
+        return unique
 
     def clean_dir(self) -> Path:
         return self.artifacts_dir / "clean"
@@ -130,7 +201,7 @@ class ProfileConfig:
         return data
 
 
-def get_profile(name: str = "local_profile", run_bert_override: bool | None = None) -> ProfileConfig:
+def get_profile(name: str = "local_profile", run_bert_override: Optional[bool] = None) -> ProfileConfig:
     """Build the requested execution profile."""
 
     if name == "local_profile":
@@ -144,6 +215,70 @@ def get_profile(name: str = "local_profile", run_bert_override: bool | None = No
             hdbscan_subset_size=20_000,
             agglomerative_subset_size=5_000,
             silhouette_eval_sample_size=10_000,
+            svd_components=150,
+            umap_components=35,
+            umap_neighbors=(15, 30, 50),
+            umap_min_dists=(0.0, 0.1),
+            mpnet_batch_size=32,
+            bert_batch_size=16,
+            bert_max_length=320,
+            run_bert=True,
+            retrieval_backend="faiss",
+        )
+    elif name == "colab_a100_profile":
+        profile = ProfileConfig(
+            name="colab_a100_profile",
+            main_tf_idf_subset_size=200_000,
+            main_mpnet_subset_size=80_000,
+            main_bert_subset_size=30_000,
+            hdbscan_subset_size=30_000,
+            agglomerative_subset_size=10_000,
+            silhouette_eval_sample_size=15_000,
+            tfidf_max_features=100_000,
+            svd_components=200,
+            umap_components=50,
+            umap_neighbors=(15, 30, 50),
+            umap_min_dists=(0.0, 0.05, 0.1),
+            mpnet_batch_size=64,
+            bert_batch_size=32,
+            bert_max_length=384,
+            run_bert=True,
+            retrieval_backend="faiss",
+        )
+    elif name == "colab_h100_full_profile":
+        profile = ProfileConfig(
+            name="colab_h100_full_profile",
+            main_tf_idf_subset_size=200_000,
+            main_mpnet_subset_size=80_000,
+            main_bert_subset_size=30_000,
+            hdbscan_subset_size=30_000,
+            agglomerative_subset_size=10_000,
+            tfidf_main_subset_name="full_corpus",
+            bert_main_subset_name="full_corpus",
+            tfidf_main_use_full_dataset=True,
+            bert_main_use_full_dataset=True,
+            silhouette_eval_sample_size=20_000,
+            npmi_sample_size=50_000,
+            tfidf_max_features=250_000,
+            tfidf_min_df=10,
+            save_sparse_tfidf_matrices=False,
+            svd_components=256,
+            umap_components=50,
+            umap_neighbors=(15, 30, 50),
+            umap_min_dists=(0.0, 0.05, 0.1),
+            skip_umap_above_rows=120_000,
+            kmeans_mode="auto",
+            kmeans_minibatch_threshold=100_000,
+            kmeans_batch_size=8_192,
+            kmeans_max_iter=200,
+            bert_model_name="allenai/scibert_scivocab_uncased",
+            bert_batch_size=64,
+            bert_max_length=384,
+            run_mpnet=False,
+            run_bert=True,
+            run_hdbscan=False,
+            run_agglomerative=False,
+            retrieval_backend="faiss",
         )
     else:
         raise ValueError(f"Unknown profile: {name}")

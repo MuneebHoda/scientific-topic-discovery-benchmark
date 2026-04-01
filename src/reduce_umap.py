@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
 
 from src.config import ProfileConfig
-from src.io_utils import ensure_dir, load_json, load_numpy, save_numpy, upsert_csv_records, write_json
+from src.io_utils import ensure_dir, link_or_copy_file, load_json, load_numpy, save_numpy, upsert_csv_records, write_json
 
 
 def choose_proxy_k(train_label_count: int) -> int:
@@ -57,6 +57,7 @@ def run_umap_search(
     train_primary_categories,
     cache_dir: Path,
     metric: str = "cosine",
+    source_array_paths: Optional[Dict[str, Path]] = None,
 ) -> Dict:
     """Run a tiny UMAP search, cache the best reducer output, and return arrays."""
 
@@ -70,10 +71,39 @@ def run_umap_search(
         best = load_json(best_config_path, default={}) or {}
         return {
             "best_config": best,
-            "train": load_numpy(train_out),
-            "val": load_numpy(val_out),
-            "test": load_numpy(test_out),
+            "train": load_numpy(train_out, mmap_mode="r"),
+            "val": load_numpy(val_out, mmap_mode="r"),
+            "test": load_numpy(test_out, mmap_mode="r"),
             "reused_cache": True,
+        }
+
+    if int(train_embeddings.shape[0]) > int(profile.skip_umap_above_rows):
+        best_config = {
+            "embedding": embedding_name,
+            "subset_name": subset_name,
+            "reducer": "identity",
+            "reason": f"train_rows>{profile.skip_umap_above_rows}",
+        }
+        if source_array_paths:
+            link_or_copy_file(source_array_paths["train"], train_out)
+            link_or_copy_file(source_array_paths["val"], val_out)
+            link_or_copy_file(source_array_paths["test"], test_out)
+        else:
+            save_numpy(train_out, np.asarray(train_embeddings, dtype=np.float32))
+            save_numpy(val_out, np.asarray(val_embeddings, dtype=np.float32))
+            save_numpy(test_out, np.asarray(test_embeddings, dtype=np.float32))
+        write_json(best_config_path, best_config)
+        upsert_csv_records(
+            profile.reduction_dir() / "best_umap_config.csv",
+            records=[best_config],
+            key_columns=("embedding", "subset_name"),
+        )
+        return {
+            "best_config": best_config,
+            "train": load_numpy(train_out, mmap_mode="r"),
+            "val": load_numpy(val_out, mmap_mode="r"),
+            "test": load_numpy(test_out, mmap_mode="r"),
+            "reused_cache": False,
         }
 
     umap = __import__("umap")
@@ -147,8 +177,8 @@ def run_umap_search(
 
     return {
         "best_config": best_result["config"],
-        "train": best_result["train"],
-        "val": best_result["val"],
-        "test": best_result["test"],
+        "train": load_numpy(train_out, mmap_mode="r"),
+        "val": load_numpy(val_out, mmap_mode="r"),
+        "test": load_numpy(test_out, mmap_mode="r"),
         "reused_cache": False,
     }
