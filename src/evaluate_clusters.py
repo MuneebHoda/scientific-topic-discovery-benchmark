@@ -146,14 +146,15 @@ def evaluate_clustering_run(
         sampled_indices = np.arange(test_count, dtype=np.int64)
 
     sampled_texts = []
-    target_positions = set(int(idx) for idx in sampled_indices.tolist())
     cursor = 0
-    for batch in iter_split_batches(profile, subset_name, "test", columns=["text_input", "primary_category"]):
+    for batch in iter_split_batches(profile, subset_name, "test", columns=["text_input"]):
         frame = batch.to_pandas()
-        for _, row in frame.iterrows():
-            if cursor in target_positions:
-                sampled_texts.append(str(row["text_input"]))
-            cursor += 1
+        batch_start = cursor
+        batch_stop = cursor + len(frame)
+        batch_indices = sampled_indices[(sampled_indices >= batch_start) & (sampled_indices < batch_stop)] - batch_start
+        if len(batch_indices) > 0:
+            sampled_texts.extend(frame.iloc[batch_indices]["text_input"].astype(str).tolist())
+        cursor = batch_stop
     sampled_pred_labels = labels["test"][sampled_indices]
     token_cache = _load_or_build_token_cache(profile, subset_name, "test", sampled_texts)
 

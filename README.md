@@ -134,9 +134,24 @@ python -m src.run_pipeline --profile colab_h100_full_profile
 This profile is designed around the following assumptions:
 
 - `TF-IDF` can run on the full cleaned corpus with bounded vocabulary settings,
-- `BERT` embeddings can run on the full cleaned corpus using CUDA,
+- `MPNET` and `BERT` embeddings can run on the full cleaned corpus using CUDA,
 - `KMeans` should switch to a scalable path (`MiniBatchKMeans`) on large training splits,
-- `Agglomerative` and `HDBSCAN` remain disabled by default for the full-corpus H100 run because they are not the right baseline for this scale.
+- `HDBSCAN` and `Agglomerative` are also pointed at `full_corpus` in this profile, but they remain the least practical stages at this scale and should be treated as explicit scalability stress tests.
+
+In `colab_h100_full_profile`, the modeling inputs for `TF-IDF`, `MPNET`, `BERT`, `KMeans`, `HDBSCAN`, and `Agglomerative` are all pointed at the **full cleaned corpus**, not a sampled subset. The only remaining sampling in that profile is for expensive evaluation metrics such as:
+
+- silhouette score computation,
+- NPMI topic-coherence estimation.
+
+Those are sampled intentionally because full-corpus versions of those metrics are disproportionately expensive and do not change the fact that the underlying embeddings and clustering runs use the full dataset.
+
+In the profile config, a subset size of `None` is treated as a full-corpus run for that pipeline family.
+
+For this profile, `subset_configs()` resolves to a single benchmark subset:
+
+- `full_corpus`
+
+That means the pipeline no longer creates separate sampled modeling subsets for the major methods in the H100 configuration.
 
 The pipeline looks for the raw JSON in these places, in order:
 
@@ -151,6 +166,30 @@ The older subset-oriented profiles are still available:
 - `full_profile`
 - `colab_a100_profile`
 - `colab_h100_full_profile`
+
+## Generated Benchmark Review Notebook
+
+After `src.run_pipeline` finishes, the pipeline also generates a polished results-review notebook in:
+
+- `artifacts/modeling/results/<profile>_Benchmark_Summary.ipynb`
+
+For example, the H100 profile writes:
+
+- `artifacts/modeling/results/colab_h100_full_profile_Benchmark_Summary.ipynb`
+
+This notebook is designed for project reporting. It summarizes:
+
+- execution scope and split sizes,
+- which pipelines completed successfully,
+- clustering rankings by `NMI`, `NPMI`, and `silhouette`,
+- validation-to-test gaps,
+- recovered cluster granularity relative to reference categories,
+- runtime and scalability notes,
+- retrieval metrics and examples,
+- final report-ready findings and recommendations.
+
+The accompanying report artifacts are also written with profile-specific filenames, so runs from
+different profiles do not overwrite one another inside `artifacts/modeling/results/`.
 
 ## Expected Output
 

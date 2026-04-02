@@ -1,4 +1,4 @@
-"""Small-scale agglomerative clustering with centroid assignment to held-out splits."""
+"""Agglomerative clustering with centroid assignment to held-out splits."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _assign_to_centroids(embeddings: np.ndarray, centroids: np.ndarray) -> np.nd
 
 
 def run_agglomerative_clustering(profile: ProfileConfig, embedding_name: str, subset_name: str) -> Dict:
-    """Tune Ward agglomerative clustering on the tiny benchmark subset."""
+    """Tune Ward agglomerative clustering on the configured split set."""
 
     output_dir = _output_dir(profile, embedding_name, subset_name)
     metadata_path = output_dir / "metadata.json"
@@ -36,9 +36,9 @@ def run_agglomerative_clustering(profile: ProfileConfig, embedding_name: str, su
         return metadata
 
     reduced_dir = profile.embeddings_dir() / embedding_name / subset_name / "reduced"
-    train_embeddings = load_numpy(reduced_dir / "train_reduced.npy")
-    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy")
-    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy")
+    train_embeddings = load_numpy(reduced_dir / "train_reduced.npy", mmap_mode="r")
+    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy", mmap_mode="r")
+    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy", mmap_mode="r")
 
     search_rows = []
     best = None
@@ -93,7 +93,7 @@ def run_agglomerative_clustering(profile: ProfileConfig, embedding_name: str, su
         "runtime_seconds": time.perf_counter() - start,
         "reused_cache": False,
         "notes": (
-            "Ward linkage trained on the small subset; val/test labels assigned by nearest train centroid. "
+            "Ward linkage trained on the configured train split; val/test labels assigned by nearest train centroid. "
             + notes
         ).strip(),
     }

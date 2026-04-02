@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 
-from src.benchmark_splits import load_subset_split_frames
+from src.benchmark_splits import load_split_frame
 from src.config import ProfileConfig
 from src.io_utils import ensure_dir, load_numpy, write_json
 
@@ -76,8 +76,10 @@ def _build_index(backend: str):
     return SklearnCosineIndex(), "sklearn"
 
 
-def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: str = "mpnet_main") -> pd.DataFrame:
-    """Evaluate centroid-based dense retrieval over the MPNET train split."""
+def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: Optional[str] = None) -> pd.DataFrame:
+    """Evaluate centroid-based dense retrieval over the configured MPNET train split."""
+
+    subset_name = subset_name or profile.mpnet_main_subset_name
 
     output_dir = ensure_dir(profile.retrieval_dir())
     metrics_path = output_dir / "retrieval_metrics.csv"
@@ -86,20 +88,21 @@ def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: str = "mpnet_m
     if metrics_path.exists() and examples_path.exists() and metadata_path.exists():
         return pd.read_csv(metrics_path)
 
-    split_frames = load_subset_split_frames(profile, subset_name)
-    train_embeddings = load_numpy(profile.embeddings_dir() / "mpnet" / subset_name / "train_raw.npy")
-    train_ids = split_frames["train"]["id"].astype(str).tolist()
-    train_labels = split_frames["train"]["primary_category"].astype(str).tolist()
+    train_frame = load_split_frame(profile, subset_name, "train", columns=["id", "primary_category"]).reset_index(drop=True)
+    test_frame = load_split_frame(profile, subset_name, "test", columns=["primary_category"]).reset_index(drop=True)
+    train_embeddings = load_numpy(profile.embeddings_dir() / "mpnet" / subset_name / "train_raw.npy", mmap_mode="r")
+    train_ids = train_frame["id"].astype(str).tolist()
+    train_labels = train_frame["primary_category"].astype(str).tolist()
 
     index, actual_backend = _build_index(profile.retrieval_backend)
     index.fit(train_embeddings, train_ids, train_labels)
 
-    train_frame = split_frames["train"].copy()
-    train_frame["embedding_index"] = np.arange(len(train_frame))
-    test_counts = split_frames["test"]["primary_category"].value_counts().to_dict()
+    centroid_frame = train_frame.copy()
+    centroid_frame["embedding_index"] = np.arange(len(centroid_frame))
+    test_counts = test_frame["primary_category"].astype(str).value_counts().to_dict()
 
     category_centroids = {}
-    for category, group in train_frame.groupby("primary_category", sort=True):
+    for category, group in centroid_frame.groupby("primary_category", sort=True):
         idx = group["embedding_index"].to_numpy()
         category_centroids[category] = train_embeddings[idx].mean(axis=0).astype(np.float32)
 
@@ -160,7 +163,7 @@ def evaluate_mpnet_retrieval(profile: ProfileConfig, subset_name: str = "mpnet_m
             "backend": actual_backend,
             "subset_name": subset_name,
             "train_size": int(len(train_frame)),
-            "test_size": int(len(split_frames["test"])),
+            "test_size": int(len(test_frame)),
             "category_query_count": int(len(category_centroids)),
             "note": "Category centroid pseudo-queries are weighted by held-out test support.",
         },

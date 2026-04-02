@@ -1,4 +1,4 @@
-"""Reduced-subset HDBSCAN clustering with repaired noise labels."""
+"""HDBSCAN clustering with repaired noise labels."""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def _repair_noise_labels(train_embeddings: np.ndarray, train_labels: np.ndarray,
 
 
 def run_hdbscan_clustering(profile: ProfileConfig, embedding_name: str, subset_name: str) -> Dict:
-    """Tune HDBSCAN on a reduced subset and cache raw plus repaired labels."""
+    """Tune HDBSCAN on the configured split set and cache raw plus repaired labels."""
 
     hdbscan = __import__("hdbscan")
     prediction = __import__("hdbscan.prediction", fromlist=["approximate_predict"])
@@ -51,9 +51,9 @@ def run_hdbscan_clustering(profile: ProfileConfig, embedding_name: str, subset_n
         return metadata
 
     reduced_dir = profile.embeddings_dir() / embedding_name / subset_name / "reduced"
-    train_embeddings = load_numpy(reduced_dir / "train_reduced.npy")
-    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy")
-    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy")
+    train_embeddings = load_numpy(reduced_dir / "train_reduced.npy", mmap_mode="r")
+    val_embeddings = load_numpy(reduced_dir / "val_reduced.npy", mmap_mode="r")
+    test_embeddings = load_numpy(reduced_dir / "test_reduced.npy", mmap_mode="r")
 
     search_rows = []
     best = None
@@ -124,4 +124,3 @@ def run_hdbscan_clustering(profile: ProfileConfig, embedding_name: str, subset_n
     }
     write_json(metadata_path, metadata)
     return metadata
-

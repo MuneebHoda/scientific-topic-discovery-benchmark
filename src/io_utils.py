@@ -10,7 +10,7 @@ import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Dict, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -38,22 +38,6 @@ def write_json(path: Path, payload) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
-
-
-def read_id_csv(path: Path) -> List[str]:
-    """Load a one-column CSV of ids."""
-
-    frame = pd.read_csv(path)
-    if "id" not in frame.columns:
-        raise ValueError(f"Expected an id column in {path}")
-    return frame["id"].astype(str).tolist()
-
-
-def write_id_csv(path: Path, ids: Sequence[str]) -> None:
-    """Write a deterministic one-column CSV of ids."""
-
-    ensure_dir(path.parent)
-    pd.DataFrame({"id": list(ids)}).to_csv(path, index=False)
 
 
 def stable_sha1(text: str) -> str:

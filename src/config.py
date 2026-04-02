@@ -51,18 +51,21 @@ class ProfileConfig:
     eda_dir: Path = EDA_DIR
     artifacts_dir: Path = MODELING_DIR
     seed: int = RANDOM_SEED
-    main_tf_idf_subset_size: int = 40_000
-    main_mpnet_subset_size: int = 12_000
-    main_bert_subset_size: int = 5_000
-    hdbscan_subset_size: int = 8_000
-    agglomerative_subset_size: int = 2_500
+    main_tf_idf_subset_size: Optional[int] = 40_000
+    main_mpnet_subset_size: Optional[int] = 12_000
+    main_bert_subset_size: Optional[int] = 5_000
+    hdbscan_subset_size: Optional[int] = 8_000
+    agglomerative_subset_size: Optional[int] = 2_500
     tfidf_main_subset_name: str = "tfidf_main"
     mpnet_main_subset_name: str = "mpnet_main"
     bert_main_subset_name: str = "bert_main"
     hdbscan_subset_name: str = "hdbscan_shared"
     agglomerative_subset_name: str = "agglomerative_small"
     tfidf_main_use_full_dataset: bool = False
+    mpnet_main_use_full_dataset: bool = False
     bert_main_use_full_dataset: bool = False
+    hdbscan_use_full_dataset: bool = False
+    agglomerative_use_full_dataset: bool = False
     silhouette_eval_sample_size: int = 5_000
     npmi_sample_size: int = 25_000
     tfidf_max_features: int = 50_000
@@ -94,42 +97,87 @@ class ProfileConfig:
     val_fraction: float = 0.1
     test_fraction: float = 0.2
 
+    def tfidf_main_runs_full_corpus(self) -> bool:
+        return bool(self.tfidf_main_use_full_dataset or self.main_tf_idf_subset_size is None)
+
+    def mpnet_main_runs_full_corpus(self) -> bool:
+        return bool(self.mpnet_main_use_full_dataset or self.main_mpnet_subset_size is None)
+
+    def bert_main_runs_full_corpus(self) -> bool:
+        return bool(self.bert_main_use_full_dataset or self.main_bert_subset_size is None)
+
+    def hdbscan_runs_full_corpus(self) -> bool:
+        return bool(self.hdbscan_use_full_dataset or self.hdbscan_subset_size is None)
+
+    def agglomerative_runs_full_corpus(self) -> bool:
+        return bool(self.agglomerative_use_full_dataset or self.agglomerative_subset_size is None)
+
     def subset_configs(self) -> Dict[str, SubsetConfig]:
         """Return the configured benchmark subsets."""
+
+        tfidf_full = self.tfidf_main_runs_full_corpus()
+        mpnet_full = self.mpnet_main_runs_full_corpus()
+        bert_full = self.bert_main_runs_full_corpus()
+        hdbscan_full = self.hdbscan_runs_full_corpus()
+        agglomerative_full = self.agglomerative_runs_full_corpus()
 
         requested = [
             SubsetConfig(
                 name=self.tfidf_main_subset_name,
-                size=None if self.tfidf_main_use_full_dataset else self.main_tf_idf_subset_size,
-                min_category_count=1 if self.tfidf_main_use_full_dataset else 25,
-                min_subset_per_category=1 if self.tfidf_main_use_full_dataset else 5,
-                use_full_dataset=self.tfidf_main_use_full_dataset,
+                size=None if tfidf_full else self.main_tf_idf_subset_size,
+                min_category_count=1 if tfidf_full else 25,
+                min_subset_per_category=1 if tfidf_full else 5,
+                use_full_dataset=tfidf_full,
             ),
         ]
         if self.run_mpnet:
+            if not mpnet_full and self.main_mpnet_subset_size is None:
+                raise ValueError("`main_mpnet_subset_size` must be set when `run_mpnet=True` and not using the full dataset.")
             requested.append(
                 SubsetConfig(
                     name=self.mpnet_main_subset_name,
-                    size=self.main_mpnet_subset_size,
-                    min_category_count=25,
-                    min_subset_per_category=5,
-                    use_full_dataset=False,
+                    size=None if mpnet_full else self.main_mpnet_subset_size,
+                    min_category_count=1 if mpnet_full else 25,
+                    min_subset_per_category=1 if mpnet_full else 5,
+                    use_full_dataset=mpnet_full,
                 )
             )
         if self.run_bert:
+            if not bert_full and self.main_bert_subset_size is None:
+                raise ValueError("`main_bert_subset_size` must be set when `run_bert=True` and not using the full dataset.")
             requested.append(
                 SubsetConfig(
                     name=self.bert_main_subset_name,
-                    size=None if self.bert_main_use_full_dataset else self.main_bert_subset_size,
-                    min_category_count=1 if self.bert_main_use_full_dataset else 25,
-                    min_subset_per_category=1 if self.bert_main_use_full_dataset else 5,
-                    use_full_dataset=self.bert_main_use_full_dataset,
+                    size=None if bert_full else self.main_bert_subset_size,
+                    min_category_count=1 if bert_full else 25,
+                    min_subset_per_category=1 if bert_full else 5,
+                    use_full_dataset=bert_full,
                 )
             )
         if self.run_hdbscan:
-            requested.append(SubsetConfig(name=self.hdbscan_subset_name, size=self.hdbscan_subset_size))
+            if not hdbscan_full and self.hdbscan_subset_size is None:
+                raise ValueError("`hdbscan_subset_size` must be set when `run_hdbscan=True` and not using the full dataset.")
+            requested.append(
+                SubsetConfig(
+                    name=self.hdbscan_subset_name,
+                    size=None if hdbscan_full else self.hdbscan_subset_size,
+                    min_category_count=1 if hdbscan_full else 25,
+                    min_subset_per_category=1 if hdbscan_full else 5,
+                    use_full_dataset=hdbscan_full,
+                )
+            )
         if self.run_agglomerative:
-            requested.append(SubsetConfig(name=self.agglomerative_subset_name, size=self.agglomerative_subset_size))
+            if not agglomerative_full and self.agglomerative_subset_size is None:
+                raise ValueError("`agglomerative_subset_size` must be set when `run_agglomerative=True` and not using the full dataset.")
+            requested.append(
+                SubsetConfig(
+                    name=self.agglomerative_subset_name,
+                    size=None if agglomerative_full else self.agglomerative_subset_size,
+                    min_category_count=1 if agglomerative_full else 25,
+                    min_subset_per_category=1 if agglomerative_full else 5,
+                    use_full_dataset=agglomerative_full,
+                )
+            )
 
         unique: Dict[str, SubsetConfig] = {}
         for spec in requested:
@@ -187,7 +235,25 @@ class ProfileConfig:
         return self.retrieval_dir() / "retrieval_metrics.csv"
 
     def pipeline_status_path(self) -> Path:
-        return self.results_dir() / "pipeline_status.csv"
+        return self.results_dir() / f"{self.name}_pipeline_status.csv"
+
+    def results_clustering_full_path(self) -> Path:
+        return self.results_dir() / f"{self.name}_clustering_results_full.csv"
+
+    def results_clustering_report_path(self) -> Path:
+        return self.results_dir() / f"{self.name}_clustering_results_report.csv"
+
+    def results_retrieval_full_path(self) -> Path:
+        return self.results_dir() / f"{self.name}_retrieval_results_full.csv"
+
+    def results_retrieval_report_path(self) -> Path:
+        return self.results_dir() / f"{self.name}_retrieval_results_report.csv"
+
+    def results_split_report_path(self) -> Path:
+        return self.results_dir() / f"{self.name}_split_report.json"
+
+    def results_profile_summary_path(self) -> Path:
+        return self.results_dir() / f"{self.name}_profile_summary.json"
 
     def to_jsonable(self) -> Dict[str, Any]:
         """Convert the profile to a JSON-serializable dictionary."""
@@ -248,15 +314,21 @@ def get_profile(name: str = "local_profile", run_bert_override: Optional[bool] =
     elif name == "colab_h100_full_profile":
         profile = ProfileConfig(
             name="colab_h100_full_profile",
-            main_tf_idf_subset_size=200_000,
-            main_mpnet_subset_size=80_000,
-            main_bert_subset_size=30_000,
-            hdbscan_subset_size=30_000,
-            agglomerative_subset_size=10_000,
+            main_tf_idf_subset_size=None,
+            main_mpnet_subset_size=None,
+            main_bert_subset_size=None,
+            hdbscan_subset_size=None,
+            agglomerative_subset_size=None,
             tfidf_main_subset_name="full_corpus",
+            mpnet_main_subset_name="full_corpus",
             bert_main_subset_name="full_corpus",
+            hdbscan_subset_name="full_corpus",
+            agglomerative_subset_name="full_corpus",
             tfidf_main_use_full_dataset=True,
+            mpnet_main_use_full_dataset=True,
             bert_main_use_full_dataset=True,
+            hdbscan_use_full_dataset=True,
+            agglomerative_use_full_dataset=True,
             silhouette_eval_sample_size=20_000,
             npmi_sample_size=50_000,
             tfidf_max_features=250_000,
@@ -274,10 +346,10 @@ def get_profile(name: str = "local_profile", run_bert_override: Optional[bool] =
             bert_model_name="allenai/scibert_scivocab_uncased",
             bert_batch_size=64,
             bert_max_length=384,
-            run_mpnet=False,
+            run_mpnet=True,
             run_bert=True,
-            run_hdbscan=False,
-            run_agglomerative=False,
+            run_hdbscan=True,
+            run_agglomerative=True,
             retrieval_backend="faiss",
         )
     else:

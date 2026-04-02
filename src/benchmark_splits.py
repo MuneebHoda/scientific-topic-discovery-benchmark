@@ -12,7 +12,7 @@ from typing import Dict, Iterable, List, Sequence
 import pandas as pd
 
 from src.config import ProfileConfig, SubsetConfig
-from src.io_utils import ensure_dir, load_json, read_id_csv, stable_int, write_id_csv, write_json
+from src.io_utils import ensure_dir, load_json, stable_int, write_json
 
 
 @dataclass
@@ -176,10 +176,6 @@ def _subset_path(profile: ProfileConfig, subset_name: str) -> Path:
     return profile.splits_dir() / f"{subset_name}.parquet"
 
 
-def _split_csv_path(profile: ProfileConfig, subset_name: str, split_name: str) -> Path:
-    return profile.splits_dir() / f"{subset_name}_{split_name}_ids.csv"
-
-
 def split_parquet_path(profile: ProfileConfig, subset_name: str, split_name: str) -> Path:
     return profile.splits_dir() / f"{subset_name}_{split_name}.parquet"
 
@@ -198,9 +194,6 @@ def subset_exists(profile: ProfileConfig, subset_name: str) -> bool:
         split_parquet_path(profile, subset_name, "train").exists()
         and split_parquet_path(profile, subset_name, "val").exists()
         and split_parquet_path(profile, subset_name, "test").exists()
-        and _split_csv_path(profile, subset_name, "train").exists()
-        and _split_csv_path(profile, subset_name, "val").exists()
-        and _split_csv_path(profile, subset_name, "test").exists()
     )
 
 
@@ -281,8 +274,6 @@ def _create_full_dataset_subset(
         val_fraction=profile.val_fraction,
         test_fraction=profile.test_fraction,
     )
-    for split_name, ids in splits.items():
-        write_id_csv(_split_csv_path(profile, spec.name, split_name), ids)
     _write_split_parquets_from_clean_dataset(profile, spec.name, splits, batch_size=batch_size)
 
     return {
@@ -368,8 +359,6 @@ def create_benchmark_subsets(
             val_fraction=profile.val_fraction,
             test_fraction=profile.test_fraction,
         )
-        for split_name, ids in splits.items():
-            write_id_csv(_split_csv_path(profile, subset_name, split_name), ids)
         _write_split_parquets_from_frame(profile, subset_name, subset_frame, splits)
 
         split_summary["subset_summaries"][subset_name] = {
@@ -387,18 +376,6 @@ def create_benchmark_subsets(
     return split_summary
 
 
-def load_subset(profile: ProfileConfig, subset_name: str) -> pd.DataFrame:
-    """Load a saved subset parquet or reconstruct it from split parquets."""
-
-    subset_path = _subset_path(profile, subset_name)
-    if subset_path.exists():
-        return pd.read_parquet(subset_path)
-
-    frames = [load_split_frame(profile, subset_name, split_name) for split_name in ("train", "val", "test")]
-    frame = pd.concat(frames, ignore_index=True)
-    return frame
-
-
 def load_split_frame(profile: ProfileConfig, subset_name: str, split_name: str, columns=None) -> pd.DataFrame:
     """Load a single split parquet."""
 
@@ -409,12 +386,3 @@ def iter_split_batches(profile: ProfileConfig, subset_name: str, split_name: str
     """Yield parquet batches for a saved split."""
 
     yield from _iter_parquet_batches(split_parquet_path(profile, subset_name, split_name), batch_size=batch_size, columns=columns)
-
-
-def load_subset_split_frames(profile: ProfileConfig, subset_name: str) -> Dict[str, pd.DataFrame]:
-    """Load split parquet files directly into dataframes."""
-
-    return {
-        split_name: load_split_frame(profile, subset_name, split_name).reset_index(drop=True)
-        for split_name in ("train", "val", "test")
-    }
