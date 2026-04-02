@@ -67,6 +67,7 @@ def _ensure_embedding(
     embedding_name: str,
     subset_name: str,
     completed: Set[EmbeddingKey],
+    failed: Set[EmbeddingKey],
 ) -> Optional[Dict]:
     """Run an embedding stage once per embedding/subset pair."""
 
@@ -74,6 +75,9 @@ def _ensure_embedding(
     if key in completed:
         print(f"[run_pipeline] reusing scheduled embedding stage {embedding_name}/{subset_name}")
         return {}
+    if key in failed:
+        print(f"[run_pipeline] skipping embedding stage after earlier failure {embedding_name}/{subset_name}")
+        return None
 
     result = _run_step(
         f"{embedding_name}_embedding_{subset_name}",
@@ -81,6 +85,8 @@ def _ensure_embedding(
     )
     if result is not None:
         completed.add(key)
+    else:
+        failed.add(key)
     return result
 
 
@@ -90,6 +96,7 @@ def _ensure_clustering(
     clustering_name: str,
     subset_name: str,
     completed: Set[ClusteringKey],
+    failed: Set[ClusteringKey],
 ) -> Optional[Dict]:
     """Run a clustering stage once per embedding/clustering/subset combination."""
 
@@ -97,6 +104,9 @@ def _ensure_clustering(
     if key in completed:
         print(f"[run_pipeline] reusing scheduled clustering stage {embedding_name}/{clustering_name}/{subset_name}")
         return {}
+    if key in failed:
+        print(f"[run_pipeline] skipping clustering stage after earlier failure {embedding_name}/{clustering_name}/{subset_name}")
+        return None
 
     result = _run_step(
         f"{embedding_name}_{clustering_name}_{subset_name}",
@@ -104,6 +114,8 @@ def _ensure_clustering(
     )
     if result is not None:
         completed.add(key)
+    else:
+        failed.add(key)
     return result
 
 
@@ -113,6 +125,7 @@ def _ensure_clustering_metrics(
     clustering_name: str,
     subset_name: str,
     completed: Set[ClusteringKey],
+    failed: Set[ClusteringKey],
 ) -> Optional[Dict]:
     """Run the evaluation stage once per embedding/clustering/subset combination."""
 
@@ -120,6 +133,9 @@ def _ensure_clustering_metrics(
     if key in completed:
         print(f"[run_pipeline] reusing scheduled metrics stage {embedding_name}/{clustering_name}/{subset_name}")
         return {}
+    if key in failed:
+        print(f"[run_pipeline] skipping metrics stage after earlier failure {embedding_name}/{clustering_name}/{subset_name}")
+        return None
 
     result = _run_step(
         f"{embedding_name}_{clustering_name}_metrics_{subset_name}",
@@ -127,6 +143,8 @@ def _ensure_clustering_metrics(
     )
     if result is not None:
         completed.add(key)
+    else:
+        failed.add(key)
     return result
 
 
@@ -136,16 +154,19 @@ def _run_clustering_bundle(
     clustering_name: str,
     subset_name: str,
     embedding_stages: Set[EmbeddingKey],
+    failed_embedding_stages: Set[EmbeddingKey],
     clustering_stages: Set[ClusteringKey],
+    failed_clustering_stages: Set[ClusteringKey],
     metric_stages: Set[ClusteringKey],
+    failed_metric_stages: Set[ClusteringKey],
 ) -> None:
     """Run embedding, clustering, and evaluation for one configured pipeline bundle."""
 
-    if _ensure_embedding(profile, embedding_name, subset_name, embedding_stages) is None:
+    if _ensure_embedding(profile, embedding_name, subset_name, embedding_stages, failed_embedding_stages) is None:
         return
-    if _ensure_clustering(profile, embedding_name, clustering_name, subset_name, clustering_stages) is None:
+    if _ensure_clustering(profile, embedding_name, clustering_name, subset_name, clustering_stages, failed_clustering_stages) is None:
         return
-    _ensure_clustering_metrics(profile, embedding_name, clustering_name, subset_name, metric_stages)
+    _ensure_clustering_metrics(profile, embedding_name, clustering_name, subset_name, metric_stages, failed_metric_stages)
 
 
 def _print_profile_notes(profile: ProfileConfig) -> None:
@@ -178,8 +199,11 @@ def main() -> None:
     _run_step("create_benchmark_subsets", lambda: create_benchmark_subsets(profile))
 
     embedding_stages: Set[EmbeddingKey] = set()
+    failed_embedding_stages: Set[EmbeddingKey] = set()
     clustering_stages: Set[ClusteringKey] = set()
+    failed_clustering_stages: Set[ClusteringKey] = set()
     metric_stages: Set[ClusteringKey] = set()
+    failed_metric_stages: Set[ClusteringKey] = set()
 
     pipeline_bundles = [
         ("tfidf", "kmeans", profile.tfidf_main_subset_name, True),
@@ -202,12 +226,21 @@ def main() -> None:
             clustering_name=clustering_name,
             subset_name=subset_name,
             embedding_stages=embedding_stages,
+            failed_embedding_stages=failed_embedding_stages,
             clustering_stages=clustering_stages,
+            failed_clustering_stages=failed_clustering_stages,
             metric_stages=metric_stages,
+            failed_metric_stages=failed_metric_stages,
         )
 
     if profile.run_mpnet:
-        if _ensure_embedding(profile, "mpnet", profile.mpnet_main_subset_name, embedding_stages) is not None:
+        if _ensure_embedding(
+            profile,
+            "mpnet",
+            profile.mpnet_main_subset_name,
+            embedding_stages,
+            failed_embedding_stages,
+        ) is not None:
             _run_step("mpnet_retrieval", lambda: evaluate_mpnet_retrieval(profile, profile.mpnet_main_subset_name))
 
     refresh_report_artifacts(profile)

@@ -297,8 +297,12 @@ def create_benchmark_subsets(
 
     ensure_dir(profile.splits_dir())
     summary_path = profile.split_summary_path()
+    specs = profile.subset_configs()
     if summary_path.exists() and not force:
-        return load_json(summary_path, default={}) or {}
+        cached_summary = load_json(summary_path, default={}) or {}
+        if all(subset_exists(profile, subset_name) for subset_name in specs):
+            return cached_summary
+        print("[benchmark_splits] split summary found but one or more split parquet files are missing; rebuilding splits.")
 
     if force:
         for path in profile.splits_dir().glob("*"):
@@ -306,7 +310,6 @@ def create_benchmark_subsets(
                 path.unlink()
 
     category_counts = _count_categories(profile.clean_dataset_path())
-    specs = profile.subset_configs()
 
     split_summary = {
         "cleaned_row_count": int(sum(category_counts.values())),
