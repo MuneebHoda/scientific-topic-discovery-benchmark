@@ -32,8 +32,12 @@ The repository also includes a modeling pipeline in `src/` for building cleaned 
   Raw arXiv-style metadata dataset used by the notebook.
 - `requirements.txt`
   Python dependencies for running the notebook.
+- `requirements-delta.txt`
+  Delta retrieval dependencies that assume PyTorch comes from Delta's PyTorch module.
 - `scripts/build_project_notebook.py`
   Script used to generate the notebook in a reproducible way.
+- `scripts/run_delta_retrieval.sbatch`
+  Slurm batch script for full-corpus dense retrieval on NCSA Delta.
 - `src/run_pipeline.py`
   Main entrypoint for the modeling pipeline.
 - `artifacts/`
@@ -160,12 +164,84 @@ The pipeline looks for the raw JSON in these places, in order:
 - `/content/arxiv-metadata-oai-snapshot.json`,
 - `/content/drive/MyDrive/arxiv-metadata-oai-snapshot.json`
 
-The older subset-oriented profiles are still available:
+You can also pass `--data-path` directly. Large modeling artifacts default to `artifacts/modeling`, but can be moved outside the repo with `ARXIV_ARTIFACTS_DIR` or `--artifacts-dir`.
+
+Available pipeline profiles:
 
 - `local_profile`
 - `full_profile`
 - `colab_a100_profile`
 - `colab_h100_full_profile`
+- `delta_retrieval_full_profile`
+
+### Running full-corpus retrieval on Delta
+
+The raw `arxiv-metadata-oai-snapshot.json` file is intentionally not committed to git because it is several GB. A fresh clone on Delta will therefore not contain the JSON. Put the file on Delta storage and point the pipeline to it with `ARXIV_DATA_PATH`.
+
+Log in and clone the repo:
+
+```bash
+ssh <netid>@login.delta.ncsa.illinois.edu
+accounts
+git clone <repo-url>
+cd <repo-name>
+```
+
+Place the JSON and large modeling artifacts outside the repo, preferably on `$WORK`:
+
+```bash
+mkdir -p $WORK/arxiv/data
+# Transfer arxiv-metadata-oai-snapshot.json with Globus, rsync, or scp.
+export ARXIV_DATA_PATH=$WORK/arxiv/data/arxiv-metadata-oai-snapshot.json
+export ARXIV_ARTIFACTS_DIR=$WORK/arxiv/artifacts/modeling
+```
+
+Create the Python environment once:
+
+```bash
+module reset
+module load pytorch-conda/2.8
+python -m venv --system-site-packages $WORK/envs/arxiv-retrieval
+source $WORK/envs/arxiv-retrieval/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-delta.txt
+```
+
+Submit the retrieval job:
+
+```bash
+sbatch \
+  --account=<your-delta-gpu-project> \
+  --partition=gpuA100x4 \
+  scripts/run_delta_retrieval.sbatch
+```
+
+The Delta profile runs full-corpus MPNET retrieval and skips the clustering stress-test stages. Outputs are written under:
+
+```text
+$ARXIV_ARTIFACTS_DIR/retrieval/
+$ARXIV_ARTIFACTS_DIR/results/
+```
+
+For a quick environment check inside an interactive GPU allocation, run:
+
+```bash
+python - <<'PY'
+import torch
+import sentence_transformers
+print(torch.cuda.is_available())
+print(sentence_transformers.__version__)
+PY
+```
+
+You can also run the profile manually:
+
+```bash
+python -m src.run_pipeline \
+  --profile delta_retrieval_full_profile \
+  --data-path "$ARXIV_DATA_PATH" \
+  --artifacts-dir "$ARXIV_ARTIFACTS_DIR"
+```
 
 ## Generated Benchmark Review Notebook
 

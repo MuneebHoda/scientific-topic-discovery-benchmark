@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import traceback
+from dataclasses import replace
+from pathlib import Path
 from typing import Callable, Dict, Optional, Set, Tuple
 
 from src.benchmark_splits import create_benchmark_subsets
@@ -11,7 +14,7 @@ from src.build_results_notebook import build_results_notebook
 from src.cluster_agglomerative import run_agglomerative_clustering
 from src.cluster_hdbscan import run_hdbscan_clustering
 from src.cluster_kmeans import run_kmeans_clustering
-from src.config import ProfileConfig, ensure_artifact_dirs, get_profile
+from src.config import ProfileConfig, ensure_artifact_dirs, get_profile, missing_raw_data_message
 from src.dataset_builder import build_clean_dataset
 from src.embed_bert import run_bert_pipeline
 from src.embed_mpnet import run_mpnet_pipeline
@@ -178,13 +181,41 @@ def _print_profile_notes(profile: ProfileConfig) -> None:
         print("[run_pipeline] note: Agglomerative clustering is configured on full_corpus and can become prohibitively expensive.")
 
 
+def _apply_path_overrides(profile: ProfileConfig, data_path: Optional[str], artifacts_dir: Optional[str]) -> ProfileConfig:
+    """Apply optional CLI path overrides to the frozen profile."""
+
+    updates = {}
+    if data_path:
+        updates["raw_data_path"] = Path(data_path).expanduser()
+    if artifacts_dir:
+        updates["artifacts_dir"] = Path(artifacts_dir).expanduser()
+    return replace(profile, **updates) if updates else profile
+
+
+def _require_raw_data(profile: ProfileConfig) -> None:
+    """Stop early with an actionable error if the raw JSONL file is unavailable."""
+
+    if profile.raw_data_path.exists():
+        return
+    print(missing_raw_data_message(profile.raw_data_path), file=sys.stderr)
+    raise SystemExit(2)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the benchmark pipeline with cache reuse.")
     parser.add_argument(
         "--profile",
         default="local_profile",
-        choices=("local_profile", "full_profile", "colab_a100_profile", "colab_h100_full_profile"),
+        choices=(
+            "local_profile",
+            "full_profile",
+            "colab_a100_profile",
+            "colab_h100_full_profile",
+            "delta_retrieval_full_profile",
+        ),
     )
+    parser.add_argument("--data-path", help="Path to arxiv-metadata-oai-snapshot.json. Overrides ARXIV_DATA_PATH.")
+    parser.add_argument("--artifacts-dir", help="Directory for modeling artifacts. Overrides ARXIV_ARTIFACTS_DIR.")
     bert_group = parser.add_mutually_exclusive_group()
     bert_group.add_argument("--run-bert", action="store_true", help="Force-enable the BERT pipelines.")
     bert_group.add_argument("--skip-bert", action="store_true", help="Force-disable the BERT pipelines.")
@@ -192,6 +223,8 @@ def main() -> None:
 
     run_bert_override = True if args.run_bert else False if args.skip_bert else None
     profile = get_profile(args.profile, run_bert_override=run_bert_override)
+    profile = _apply_path_overrides(profile, args.data_path, args.artifacts_dir)
+    _require_raw_data(profile)
     ensure_artifact_dirs(profile)
     _print_profile_notes(profile)
 
@@ -206,13 +239,13 @@ def main() -> None:
     failed_metric_stages: Set[ClusteringKey] = set()
 
     pipeline_bundles = [
-        ("tfidf", "kmeans", profile.tfidf_main_subset_name, True),
-        ("mpnet", "kmeans", profile.mpnet_main_subset_name, bool(profile.run_mpnet)),
-        ("tfidf", "hdbscan", profile.hdbscan_subset_name, bool(profile.run_hdbscan)),
+        ("tfidf", "kmeans", profile.tfidf_main_subset_name, bool(profile.run_tfidf and profile.run_kmeans)),
+        ("mpnet", "kmeans", profile.mpnet_main_subset_name, bool(profile.run_mpnet and profile.run_kmeans)),
+        ("tfidf", "hdbscan", profile.hdbscan_subset_name, bool(profile.run_tfidf and profile.run_hdbscan)),
         ("mpnet", "hdbscan", profile.hdbscan_subset_name, bool(profile.run_mpnet and profile.run_hdbscan)),
-        ("tfidf", "agglomerative", profile.agglomerative_subset_name, bool(profile.run_agglomerative)),
+        ("tfidf", "agglomerative", profile.agglomerative_subset_name, bool(profile.run_tfidf and profile.run_agglomerative)),
         ("mpnet", "agglomerative", profile.agglomerative_subset_name, bool(profile.run_mpnet and profile.run_agglomerative)),
-        ("bert", "kmeans", profile.bert_main_subset_name, bool(profile.run_bert)),
+        ("bert", "kmeans", profile.bert_main_subset_name, bool(profile.run_bert and profile.run_kmeans)),
         ("bert", "hdbscan", profile.hdbscan_subset_name, bool(profile.run_bert and profile.run_hdbscan)),
         ("bert", "agglomerative", profile.agglomerative_subset_name, bool(profile.run_bert and profile.run_agglomerative)),
     ]

@@ -10,7 +10,7 @@ from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 
-from src.config import ProfileConfig
+from src.config import ProfileConfig, missing_raw_data_message
 from src.io_utils import ensure_dir, load_json, stable_sha1, write_json
 from src.preprocess import (
     abstract_word_len,
@@ -122,6 +122,9 @@ def build_clean_dataset(
         manifest["reused_cache"] = True
         return manifest
 
+    if not profile.raw_data_path.exists():
+        raise FileNotFoundError(missing_raw_data_message(profile.raw_data_path))
+
     if force:
         output_path.unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
@@ -225,4 +228,3 @@ def build_clean_dataset(
     }
     write_json(manifest_path, manifest)
     return manifest
-

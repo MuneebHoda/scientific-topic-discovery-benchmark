@@ -18,21 +18,21 @@ def _expected_pipeline_rows(profile: ProfileConfig) -> List[Dict]:
     return [
         {
             "pipeline_name": _pipeline_name("tfidf", "kmeans", profile.tfidf_main_subset_name),
-            "enabled_by_default": True,
+            "enabled_by_default": bool(profile.run_tfidf and profile.run_kmeans),
             "embedding": "tfidf",
             "clustering": "kmeans",
             "subset_name": profile.tfidf_main_subset_name,
         },
         {
             "pipeline_name": _pipeline_name("tfidf", "hdbscan", profile.hdbscan_subset_name),
-            "enabled_by_default": bool(profile.run_hdbscan),
+            "enabled_by_default": bool(profile.run_tfidf and profile.run_hdbscan),
             "embedding": "tfidf",
             "clustering": "hdbscan",
             "subset_name": profile.hdbscan_subset_name,
         },
         {
             "pipeline_name": _pipeline_name("mpnet", "kmeans", profile.mpnet_main_subset_name),
-            "enabled_by_default": bool(profile.run_mpnet),
+            "enabled_by_default": bool(profile.run_mpnet and profile.run_kmeans),
             "embedding": "mpnet",
             "clustering": "kmeans",
             "subset_name": profile.mpnet_main_subset_name,
@@ -46,7 +46,7 @@ def _expected_pipeline_rows(profile: ProfileConfig) -> List[Dict]:
         },
         {
             "pipeline_name": _pipeline_name("tfidf", "agglomerative", profile.agglomerative_subset_name),
-            "enabled_by_default": bool(profile.run_agglomerative),
+            "enabled_by_default": bool(profile.run_tfidf and profile.run_agglomerative),
             "embedding": "tfidf",
             "clustering": "agglomerative",
             "subset_name": profile.agglomerative_subset_name,
@@ -60,7 +60,7 @@ def _expected_pipeline_rows(profile: ProfileConfig) -> List[Dict]:
         },
         {
             "pipeline_name": _pipeline_name("bert", "kmeans", profile.bert_main_subset_name),
-            "enabled_by_default": bool(profile.run_bert),
+            "enabled_by_default": bool(profile.run_bert and profile.run_kmeans),
             "embedding": "bert",
             "clustering": "kmeans",
             "subset_name": profile.bert_main_subset_name,
@@ -106,10 +106,10 @@ def _profile_summary(profile: ProfileConfig, split_summary: Dict) -> Dict:
         },
         "full_corpus_subsets": sorted(subset_name for subset_name, spec in subset_configs.items() if spec.use_full_dataset),
         "enabled_components": {
-            "tfidf": True,
+            "tfidf": bool(profile.run_tfidf),
             "mpnet": bool(profile.run_mpnet),
             "bert": bool(profile.run_bert),
-            "kmeans": True,
+            "kmeans": bool(profile.run_kmeans),
             "hdbscan": bool(profile.run_hdbscan),
             "agglomerative": bool(profile.run_agglomerative),
             "retrieval": bool(profile.run_mpnet),
@@ -243,10 +243,14 @@ def refresh_report_artifacts(profile: ProfileConfig) -> Dict[str, str]:
 
     status_rows = []
     for spec in _expected_pipeline_rows(profile):
-        if spec["clustering"] == "retrieval":
+        if not spec["enabled_by_default"]:
+            ran = False
+            success = False
+            reason = "disabled_by_default"
+        elif spec["clustering"] == "retrieval":
             ran = retrieval_path.exists()
             success = ran and not retrieval.empty
-            reason = "" if success else ("disabled_by_default" if not spec["enabled_by_default"] else "not_run_or_skipped")
+            reason = "" if success else "not_run_or_skipped"
         elif not clustering.empty:
             row = clustering[
                 (clustering["embedding"] == spec["embedding"])
@@ -255,11 +259,11 @@ def refresh_report_artifacts(profile: ProfileConfig) -> Dict[str, str]:
             ]
             ran = not row.empty
             success = bool(ran and row["ran_successfully"].fillna(False).iloc[-1])
-            reason = "" if success else ("disabled_by_default" if not spec["enabled_by_default"] else "not_run_or_skipped")
+            reason = "" if success else "not_run_or_skipped"
         else:
             ran = False
             success = False
-            reason = "disabled_by_default" if not spec["enabled_by_default"] else "not_run_or_skipped"
+            reason = "not_run_or_skipped"
 
         status_rows.append(
             {

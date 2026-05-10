@@ -14,8 +14,9 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 def _resolve_raw_data_path() -> Path:
     env_path = os.environ.get("ARXIV_DATA_PATH")
+    if env_path:
+        return Path(env_path).expanduser()
     candidates = [
-        Path(env_path) if env_path else None,
         ROOT_DIR / "arxiv-metadata-oai-snapshot.json",
         Path("/content/arxiv-metadata-oai-snapshot.json"),
         Path("/content/drive/MyDrive/arxiv-metadata-oai-snapshot.json"),
@@ -26,9 +27,30 @@ def _resolve_raw_data_path() -> Path:
     return ROOT_DIR / "arxiv-metadata-oai-snapshot.json"
 
 
+def _resolve_artifacts_dir() -> Path:
+    env_path = os.environ.get("ARXIV_ARTIFACTS_DIR")
+    if env_path:
+        return Path(env_path).expanduser()
+    return ROOT_DIR / "artifacts" / "modeling"
+
+
 RAW_DATA_PATH = _resolve_raw_data_path()
 EDA_DIR = ROOT_DIR / "artifacts" / "eda_full"
-MODELING_DIR = ROOT_DIR / "artifacts" / "modeling"
+MODELING_DIR = _resolve_artifacts_dir()
+
+
+def missing_raw_data_message(path: Path) -> str:
+    """Return an actionable message for a missing raw arXiv metadata file."""
+
+    return (
+        f"Raw arXiv metadata file not found at: {path}\n"
+        "Keep arxiv-metadata-oai-snapshot.json out of git and place it on a data filesystem, then either:\n"
+        "  export ARXIV_DATA_PATH=/path/to/arxiv-metadata-oai-snapshot.json\n"
+        "or pass:\n"
+        "  python -m src.run_pipeline --data-path /path/to/arxiv-metadata-oai-snapshot.json\n"
+        "On Delta, a typical location is:\n"
+        "  $WORK/arxiv/data/arxiv-metadata-oai-snapshot.json"
+    )
 
 
 @dataclass(frozen=True)
@@ -88,8 +110,10 @@ class ProfileConfig:
     mpnet_batch_size: int = 16
     bert_batch_size: int = 8
     bert_max_length: int = 256
+    run_tfidf: bool = True
     run_bert: bool = False
     run_mpnet: bool = True
+    run_kmeans: bool = True
     run_hdbscan: bool = True
     run_agglomerative: bool = True
     retrieval_backend: str = "sklearn"
@@ -121,15 +145,19 @@ class ProfileConfig:
         hdbscan_full = self.hdbscan_runs_full_corpus()
         agglomerative_full = self.agglomerative_runs_full_corpus()
 
-        requested = [
-            SubsetConfig(
-                name=self.tfidf_main_subset_name,
-                size=None if tfidf_full else self.main_tf_idf_subset_size,
-                min_category_count=1 if tfidf_full else 25,
-                min_subset_per_category=1 if tfidf_full else 5,
-                use_full_dataset=tfidf_full,
-            ),
-        ]
+        requested = []
+        if self.run_tfidf:
+            if not tfidf_full and self.main_tf_idf_subset_size is None:
+                raise ValueError("`main_tf_idf_subset_size` must be set when `run_tfidf=True` and not using the full dataset.")
+            requested.append(
+                SubsetConfig(
+                    name=self.tfidf_main_subset_name,
+                    size=None if tfidf_full else self.main_tf_idf_subset_size,
+                    min_category_count=1 if tfidf_full else 25,
+                    min_subset_per_category=1 if tfidf_full else 5,
+                    use_full_dataset=tfidf_full,
+                )
+            )
         if self.run_mpnet:
             if not mpnet_full and self.main_mpnet_subset_size is None:
                 raise ValueError("`main_mpnet_subset_size` must be set when `run_mpnet=True` and not using the full dataset.")
@@ -350,6 +378,34 @@ def get_profile(name: str = "local_profile", run_bert_override: Optional[bool] =
             run_bert=True,
             run_hdbscan=True,
             run_agglomerative=True,
+            retrieval_backend="faiss",
+        )
+    elif name == "delta_retrieval_full_profile":
+        profile = ProfileConfig(
+            name="delta_retrieval_full_profile",
+            main_tf_idf_subset_size=None,
+            main_mpnet_subset_size=None,
+            main_bert_subset_size=None,
+            hdbscan_subset_size=None,
+            agglomerative_subset_size=None,
+            tfidf_main_subset_name="full_corpus",
+            mpnet_main_subset_name="full_corpus",
+            bert_main_subset_name="full_corpus",
+            hdbscan_subset_name="full_corpus",
+            agglomerative_subset_name="full_corpus",
+            tfidf_main_use_full_dataset=True,
+            mpnet_main_use_full_dataset=True,
+            bert_main_use_full_dataset=True,
+            hdbscan_use_full_dataset=True,
+            agglomerative_use_full_dataset=True,
+            skip_umap_above_rows=120_000,
+            mpnet_batch_size=64,
+            run_tfidf=False,
+            run_mpnet=True,
+            run_bert=False,
+            run_kmeans=False,
+            run_hdbscan=False,
+            run_agglomerative=False,
             retrieval_backend="faiss",
         )
     else:
