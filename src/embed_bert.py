@@ -43,16 +43,29 @@ def _encode_split_to_npy(
 ) -> np.ndarray:
     """Encode one saved split directly into an on-disk numpy array."""
 
-    if output_path.exists():
-        return np.load(output_path, mmap_mode="r")
-
     total_rows = split_row_count(profile, subset_name, split_name)
     hidden_size = int(model.config.hidden_size)
-    array = open_memmap(output_path, mode="w+", dtype="float32", shape=(total_rows, hidden_size))
+    expected_shape = (total_rows, hidden_size)
+
+    if output_path.exists():
+        try:
+            cached = np.load(output_path, mmap_mode="r")
+            if tuple(cached.shape) == expected_shape:
+                return cached
+        except Exception:
+            pass
+        output_path.unlink(missing_ok=True)
+
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    temp_path.unlink(missing_ok=True)
+    array = open_memmap(temp_path, mode="w+", dtype="float32", shape=expected_shape)
 
     cursor = 0
+    progress_every = 50_000
+    next_progress = progress_every
     use_autocast = device == "cuda"
     autocast_context = torch.cuda.amp.autocast if use_autocast else None
+    print(f"[bert] encoding {subset_name}/{split_name}: rows={total_rows:,} dim={hidden_size}", flush=True)
 
     for batch in iter_split_batches(profile, subset_name, split_name, columns=["text_input"]):
         frame = batch.to_pandas()
@@ -77,8 +90,13 @@ def _encode_split_to_npy(
             next_cursor = cursor + len(cls_embeddings)
             array[cursor:next_cursor] = cls_embeddings.astype(np.float32)
             cursor = next_cursor
+            if cursor >= next_progress or cursor == total_rows:
+                print(f"[bert] {subset_name}/{split_name} encoded={cursor:,}/{total_rows:,}", flush=True)
+                while next_progress <= cursor:
+                    next_progress += progress_every
 
     del array
+    temp_path.replace(output_path)
     return np.load(output_path, mmap_mode="r")
 
 

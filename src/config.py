@@ -408,6 +408,29 @@ def get_profile(name: str = "local_profile", run_bert_override: Optional[bool] =
             run_agglomerative=False,
             retrieval_backend="faiss",
         )
+    elif name == "delta_retrieval_sample_profile":
+        profile = ProfileConfig(
+            name="delta_retrieval_sample_profile",
+            main_tf_idf_subset_size=None,
+            main_mpnet_subset_size=120_000,
+            main_bert_subset_size=None,
+            hdbscan_subset_size=None,
+            agglomerative_subset_size=None,
+            tfidf_main_subset_name="delta_retrieval_sample",
+            mpnet_main_subset_name="delta_retrieval_sample",
+            bert_main_subset_name="delta_retrieval_sample",
+            hdbscan_subset_name="delta_retrieval_sample",
+            agglomerative_subset_name="delta_retrieval_sample",
+            mpnet_batch_size=64,
+            skip_umap_above_rows=50_000,
+            run_tfidf=False,
+            run_mpnet=True,
+            run_bert=False,
+            run_kmeans=False,
+            run_hdbscan=False,
+            run_agglomerative=False,
+            retrieval_backend="faiss",
+        )
     else:
         raise ValueError(f"Unknown profile: {name}")
 

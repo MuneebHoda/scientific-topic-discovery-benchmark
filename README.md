@@ -173,6 +173,7 @@ Available pipeline profiles:
 - `colab_a100_profile`
 - `colab_h100_full_profile`
 - `delta_retrieval_full_profile`
+- `delta_retrieval_sample_profile`
 
 ### Running full-corpus retrieval on Delta
 
@@ -221,6 +222,17 @@ The Delta profile runs full-corpus MPNET retrieval and skips the clustering stre
 ```text
 $ARXIV_ARTIFACTS_DIR/retrieval/
 $ARXIV_ARTIFACTS_DIR/results/
+```
+
+If allocation time is tight, use the sampled Delta profile. It reuses the same cleaned dataset but embeds a bounded retrieval subset:
+
+```bash
+sbatch \
+  --export=ALL,PIPELINE_PROFILE=delta_retrieval_sample_profile,ARXIV_DATA_PATH=$ARXIV_DATA_PATH,ARXIV_ARTIFACTS_DIR=$ARXIV_ARTIFACTS_DIR \
+  --account=<your-delta-gpu-project> \
+  --partition=gpuA100x4 \
+  --time=02:00:00 \
+  scripts/run_delta_retrieval.sbatch
 ```
 
 For a quick environment check inside an interactive GPU allocation, run:

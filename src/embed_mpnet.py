@@ -39,14 +39,27 @@ def _encode_split_to_npy(
 ) -> np.ndarray:
     """Encode a split directly into an on-disk numpy array."""
 
-    if output_path.exists():
-        return np.load(output_path, mmap_mode="r")
-
     total_rows = split_row_count(profile, subset_name, split_name)
     embedding_dim = model.get_sentence_embedding_dimension()
-    array = open_memmap(output_path, mode="w+", dtype="float32", shape=(total_rows, embedding_dim))
+    expected_shape = (total_rows, embedding_dim)
+
+    if output_path.exists():
+        try:
+            cached = np.load(output_path, mmap_mode="r")
+            if tuple(cached.shape) == expected_shape:
+                return cached
+        except Exception:
+            pass
+        output_path.unlink(missing_ok=True)
+
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    temp_path.unlink(missing_ok=True)
+    array = open_memmap(temp_path, mode="w+", dtype="float32", shape=expected_shape)
 
     cursor = 0
+    progress_every = 50_000
+    next_progress = progress_every
+    print(f"[mpnet] encoding {subset_name}/{split_name}: rows={total_rows:,} dim={embedding_dim}", flush=True)
     for batch in iter_split_batches(profile, subset_name, split_name, columns=["text_input"]):
         frame = batch.to_pandas()
         texts = frame["text_input"].astype(str).map(dense_clean).tolist()
@@ -62,8 +75,13 @@ def _encode_split_to_npy(
             next_cursor = cursor + len(batch_embeddings)
             array[cursor:next_cursor] = batch_embeddings
             cursor = next_cursor
+            if cursor >= next_progress or cursor == total_rows:
+                print(f"[mpnet] {subset_name}/{split_name} encoded={cursor:,}/{total_rows:,}", flush=True)
+                while next_progress <= cursor:
+                    next_progress += progress_every
 
     del array
+    temp_path.replace(output_path)
     return np.load(output_path, mmap_mode="r")
 
 

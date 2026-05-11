@@ -212,6 +212,7 @@ def main() -> None:
             "colab_a100_profile",
             "colab_h100_full_profile",
             "delta_retrieval_full_profile",
+            "delta_retrieval_sample_profile",
         ),
     )
     parser.add_argument("--data-path", help="Path to arxiv-metadata-oai-snapshot.json. Overrides ARXIV_DATA_PATH.")

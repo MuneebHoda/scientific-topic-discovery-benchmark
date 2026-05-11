@@ -28,6 +28,7 @@ export HF_HOME="${HF_HOME:-$WORK/arxiv/hf_home}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 export SENTENCE_TRANSFORMERS_HOME="${SENTENCE_TRANSFORMERS_HOME:-$HF_HOME/sentence_transformers}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$WORK/arxiv/cache}"
+export PIPELINE_PROFILE="${PIPELINE_PROFILE:-delta_retrieval_full_profile}"
 
 mkdir -p "$ARXIV_ARTIFACTS_DIR" "$HF_HOME" "$HF_HUB_CACHE" "$SENTENCE_TRANSFORMERS_HOME" "$XDG_CACHE_HOME"
 
@@ -48,6 +49,7 @@ source "$WORK/envs/arxiv-retrieval/bin/activate"
 echo "Job started on $(hostname)"
 echo "ARXIV_DATA_PATH=$ARXIV_DATA_PATH"
 echo "ARXIV_ARTIFACTS_DIR=$ARXIV_ARTIFACTS_DIR"
+echo "PIPELINE_PROFILE=$PIPELINE_PROFILE"
 
 python - <<'PY'
 import torch
@@ -58,6 +60,6 @@ if torch.cuda.is_available():
 PY
 
 srun python -m src.run_pipeline \
-  --profile delta_retrieval_full_profile \
+  --profile "$PIPELINE_PROFILE" \
   --data-path "$ARXIV_DATA_PATH" \
   --artifacts-dir "$ARXIV_ARTIFACTS_DIR"
